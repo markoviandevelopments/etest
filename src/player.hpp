@@ -16,6 +16,7 @@ struct Player {
     int vehicleIndex = -1;
     Mesh mesh;
     bool hasMesh = false;
+    float stairCooldown = 0.f;
 
     void init(const Vec3& p) {
         pos = p;
@@ -25,20 +26,21 @@ struct Player {
 
     static constexpr float kRadius = 0.4f;
 
-    // Call every tick (and after spawn/exit) so we never stay buried in geometry
     void ensureFree(World& world) {
         if (inVehicle) return;
-        if (world.collides(pos.x, pos.z, kRadius))
-            pos = world.resolveSolid(pos.x, pos.z, kRadius);
+        if (world.collides(pos.x, pos.z, kRadius, false)) {
+            // if outdoors stuck in solid, push out as car would
+            if (world.playerInterior < 0)
+                pos = world.resolveSolid(pos.x, pos.z, kRadius);
+        }
         pos.y = world.groundY(pos.x, pos.z);
     }
 
     void updateOnFoot(float dt, const Camera& cam, bool forward, bool back,
-                      bool left, bool right, bool run, World& world) {
+                      bool left, bool right, bool run, World& world,
+                      bool stairUp, bool stairDown) {
         if (inVehicle) return;
-
-        // If we somehow started inside a solid, eject immediately
-        ensureFree(world);
+        stairCooldown = std::max(0.f, stairCooldown - dt);
 
         Vec3 dir(0, 0, 0);
         Vec3 f = cam.forwardFlat();
@@ -49,29 +51,33 @@ struct Player {
         if (left)    dir -= r;
         if (dir.lengthSq() > 1e-6f) {
             dir = dir.normalized();
-            // Face movement direction (yaw 0 = +Z)
             yaw = std::atan2(dir.x, dir.z);
             float sp = run ? runSpeed : walkSpeed;
             Vec3 next = pos + dir * (sp * dt);
-            next.y = world.groundY(next.x, next.z);
-            if (!world.collides(next.x, next.z, kRadius))
+            if (!world.collides(next.x, next.z, kRadius, false)) {
                 pos = world.clampPos(next);
-            else {
-                // Axis slide
-                Vec3 nx = pos; nx.x = next.x; nx.y = world.groundY(nx.x, nx.z);
-                Vec3 nz = pos; nz.z = next.z; nz.y = world.groundY(nz.x, nz.z);
-                if (!world.collides(nx.x, nx.z, kRadius)) pos = world.clampPos(nx);
-                else if (!world.collides(nz.x, nz.z, kRadius)) pos = world.clampPos(nz);
-                else {
-                    // Fully blocked / nested: push out of the solid
-                    pos = world.resolveSolid(pos.x, pos.z, kRadius);
-                }
+            } else {
+                Vec3 nx = pos; nx.x = next.x;
+                Vec3 nz = pos; nz.z = next.z;
+                if (!world.collides(nx.x, nx.z, kRadius, false)) pos = world.clampPos(nx);
+                else if (!world.collides(nz.x, nz.z, kRadius, false)) pos = world.clampPos(nz);
             }
         }
+
+        world.updatePlayerInterior(pos.x, pos.z, pos.y);
+
+        // Stairs: PageUp/PageDown or Q/Z while in stairwell
+        if (stairCooldown <= 0.f) {
+            if (stairUp && world.tryUseStairs(pos.x, pos.z, true)) {
+                stairCooldown = 0.45f;
+            } else if (stairDown && world.tryUseStairs(pos.x, pos.z, false)) {
+                stairCooldown = 0.45f;
+            }
+        }
+
         pos.y = world.groundY(pos.x, pos.z);
     }
 
-    // Nearest enterable vehicle within range (returns index or -1)
     int nearestVehicle(const std::vector<Vehicle>& cars, float maxDist = 7.f) const {
         float best = maxDist;
         int besti = -1;
@@ -100,12 +106,9 @@ struct Player {
         Vehicle& v = cars[vehicleIndex];
         v.occupied = false;
         v.speed = 0.f;
-        // Prefer exit beside the car on the road; fall back to resolve
         Vec3 candidates[8] = {
-            v.pos - v.right() * 2.6f,
-            v.pos + v.right() * 2.6f,
-            v.pos - v.forward() * 3.2f,
-            v.pos + v.forward() * 3.2f,
+            v.pos - v.right() * 2.6f, v.pos + v.right() * 2.6f,
+            v.pos - v.forward() * 3.2f, v.pos + v.forward() * 3.2f,
             v.pos - v.right() * 3.5f - v.forward() * 2.f,
             v.pos + v.right() * 3.5f - v.forward() * 2.f,
             v.pos - v.right() * 3.5f + v.forward() * 2.f,
@@ -113,15 +116,16 @@ struct Player {
         };
         bool placed = false;
         for (auto& c : candidates) {
-            c.y = world.groundY(c.x, c.z);
-            if (!world.collides(c.x, c.z, kRadius)) {
+            c.y = 0.f;
+            if (!world.collides(c.x, c.z, kRadius, false)) {
                 pos = world.clampPos(c);
                 placed = true;
                 break;
             }
         }
-        if (!placed)
-            pos = world.resolveSolid(v.pos.x, v.pos.z, kRadius);
+        if (!placed) pos = world.resolveSolid(v.pos.x, v.pos.z, kRadius);
+        world.playerInterior = -1;
+        world.playerFloor = 0;
         pos.y = world.groundY(pos.x, pos.z);
         yaw = v.yaw;
         inVehicle = false;
@@ -141,8 +145,8 @@ struct Player {
         return yaw;
     }
 
-    void draw(const Shader& sh) const {
-        if (inVehicle || !hasMesh) return;
+    void draw(const Shader& sh, bool hide = false) const {
+        if (inVehicle || !hasMesh || hide) return;
         Mat4 m = Mat4::translate(pos) * Mat4::rotateY(yaw);
         sh.setMat4("uModel", m);
         mesh.draw();
@@ -170,10 +174,10 @@ struct Pedestrian {
         }
         Vec3 f(std::sin(yaw), 0, std::cos(yaw));
         Vec3 next = pos + f * (speed * dt);
-        if (!world.collides(next.x, next.z, 0.3f))
+        if (!world.collides(next.x, next.z, 0.3f, true))
             pos = world.clampPos(next);
         else
             yaw += 1.5f;
-        pos.y = world.groundY(pos.x, pos.z);
+        pos.y = 0.f;
     }
 };

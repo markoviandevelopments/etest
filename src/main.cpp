@@ -41,6 +41,8 @@ static bool gPaused = false;
 static bool gEWasDown = false;
 static bool gHWasDown = false;
 static bool gEscWasDown = false;
+static bool gVWasDown = false;
+static bool gFWasDown = false;
 static bool gShowHelp = true;
 static bool gMouseLeftClick = false;
 static int gWinW = 1920, gWinH = 1080;
@@ -865,29 +867,35 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // V = first person toggle
+            if (gKeys[GLFW_KEY_V] && !gVWasDown) gCam.toggleFirstPerson();
+            gVWasDown = gKeys[GLFW_KEY_V];
+
+            // F = repair current vehicle
+            if (gKeys[GLFW_KEY_F] && !gFWasDown) {
+                if (player.inVehicle && player.vehicleIndex >= 0 &&
+                    player.vehicleIndex < (int)cars.size()) {
+                    cars[player.vehicleIndex].repair();
+                    std::cout << "Vehicle repaired.\n";
+                }
+            }
+            gFWasDown = gKeys[GLFW_KEY_F];
+
             if (player.inVehicle && player.vehicleIndex >= 0 &&
                 player.vehicleIndex < (int)cars.size()) {
                 Vehicle& v = cars[player.vehicleIndex];
                 float throttle = 0.f, steer = 0.f;
                 if (gKeys[GLFW_KEY_W] || gKeys[GLFW_KEY_UP]) throttle += 1.f;
                 if (gKeys[GLFW_KEY_S] || gKeys[GLFW_KEY_DOWN]) throttle -= 1.f;
-                // A = left (negative steer), D = right (positive steer)
                 if (gKeys[GLFW_KEY_A] || gKeys[GLFW_KEY_LEFT]) steer -= 1.f;
                 if (gKeys[GLFW_KEY_D] || gKeys[GLFW_KEY_RIGHT]) steer += 1.f;
                 if (gKeys[GLFW_KEY_SPACE]) v.speed *= (1.f - 3.f * dt);
-                v.update(dt, throttle, steer, world);
+                float impact = v.update(dt, throttle, steer, world, &cars, player.vehicleIndex);
                 player.pos = v.pos;
                 player.yaw = v.yaw;
-
-                for (auto& other : cars) {
-                    if (&other == &v || other.occupied) continue;
-                    float d = Vec3::distance(v.pos, other.pos);
-                    if (d < 3.f && std::abs(v.speed) > 10.f) {
-                        stars = std::min(5, stars + 1);
-                        other.speed = -v.speed * 0.3f;
-                        other.yaw += 0.5f;
-                    }
-                }
+                world.playerInterior = -1;
+                if (impact > 0.25f)
+                    stars = std::min(5, stars + (impact > 0.5f ? 1 : 0));
             } else {
                 player.updateOnFoot(dt, gCam,
                     gKeys[GLFW_KEY_W] || gKeys[GLFW_KEY_UP],
@@ -895,17 +903,22 @@ int main(int argc, char** argv) {
                     gKeys[GLFW_KEY_A] || gKeys[GLFW_KEY_LEFT],
                     gKeys[GLFW_KEY_D] || gKeys[GLFW_KEY_RIGHT],
                     gKeys[GLFW_KEY_LEFT_SHIFT] || gKeys[GLFW_KEY_RIGHT_SHIFT],
-                    world);
-                // R = emergency unstuck to nearest road
-                if (gKeys[GLFW_KEY_R]) {
+                    world,
+                    gKeys[GLFW_KEY_PAGE_UP] || gKeys[GLFW_KEY_Q],
+                    gKeys[GLFW_KEY_PAGE_DOWN] || gKeys[GLFW_KEY_Z]);
+                // R = emergency unstuck outdoors
+                if (gKeys[GLFW_KEY_R] && world.playerInterior < 0) {
                     player.pos = world.findClearSpawn(player.pos.x, player.pos.z, 0.5f);
+                    world.playerInterior = -1;
                     player.ensureFree(world);
                 }
             }
 
-            // Local AI only offline (online: server drives free cars)
             if (net.offline) {
-                for (auto& c : cars) c.updateAI(dt, world);
+                for (int i = 0; i < (int)cars.size(); ++i) {
+                    if (!cars[i].occupied)
+                        cars[i].updateAI(dt, world, &cars, i);
+                }
                 for (auto& p : peds) p.update(dt, world);
             }
 
@@ -918,9 +931,9 @@ int main(int argc, char** argv) {
             }
 
             Vec3 focus = player.focusPoint(cars);
-            gCam.update(focus, player.focusYaw(cars));
-            if (player.inVehicle && player.vehicleIndex >= 0 &&
-                player.vehicleIndex < (int)cars.size()) {
+            bool driving = player.inVehicle && player.vehicleIndex >= 0;
+            gCam.update(focus, player.focusYaw(cars), driving);
+            if (!gCam.firstPerson && driving) {
                 float ty = cars[player.vehicleIndex].yaw;
                 float blend = 2.5f * dt;
                 float dy = wrapAngle(ty - gCam.yaw);
@@ -963,7 +976,7 @@ int main(int argc, char** argv) {
         worldSh.setInt("uMode", 0);
 
         for (const auto& c : cars) c.draw(worldSh);
-        player.draw(worldSh);
+        player.draw(worldSh, gCam.firstPerson);
 
         for (const auto& p : peds) {
             if (!p.mesh) continue;
@@ -1138,17 +1151,34 @@ int main(int argc, char** argv) {
                                       0.45f, 1.f, 0.55f, 1.f, gWinW, gWinH);
         }
 
+        // Damage / interior / camera HUD
+        if (player.inVehicle && player.vehicleIndex >= 0 &&
+            player.vehicleIndex < (int)cars.size()) {
+            float dmg = cars[player.vehicleIndex].damage;
+            std::snprintf(line, sizeof(line), "DAMAGE  %d%%   [F] Repair", (int)(dmg * 100.f));
+            float dr = lerpf(0.3f, 1.f, dmg), dg = lerpf(0.95f, 0.25f, dmg);
+            text.drawShadowed(line, -0.95f, -0.95f, 0.48f, dr, dg, 0.3f, 1.f, gWinW, gWinH);
+        }
+        if (world.playerInterior >= 0) {
+            std::snprintf(line, sizeof(line), "INSIDE  Floor %d/%d   [Q/PgUp] up  [Z/PgDn] down",
+                          world.playerFloor + 1,
+                          world.buildings[world.playerInterior].floors);
+            text.drawShadowed(line, -0.2f, -0.35f, 0.5f, 0.85f, 0.9f, 1.f, 1.f, gWinW, gWinH);
+        }
+        text.drawShadowed(gCam.firstPerson ? "VIEW  First Person  [V]" : "VIEW  Third Person  [V]",
+                          0.42f, -0.95f, 0.42f, 0.8f, 0.85f, 1.f, 1.f, gWinW, gWinH);
+
         if (gShowHelp && !gPaused) {
             const char* helpLines[] = {
                 "CONTROLS",
                 "WASD  Move / Drive",
-                "Shift  Run",
-                "Mouse  Look  |  Scroll Zoom",
-                "E  Enter / Exit car",
-                "R  Unstuck",
-                "Space  Handbrake",
-                "Esc  Pause menu",
-                "H  Toggle this help",
+                "Shift  Run   Mouse Look",
+                "E  Enter/Exit car",
+                "F  Repair car   V  1st person",
+                "Q/Z or PgUp/Dn  Stairs",
+                "R  Unstuck   Space  Brake",
+                "Walk into doors (open buildings)",
+                "Esc Pause   H Help",
             };
             float y = 0.64f;
             for (const char* hl : helpLines) {
@@ -1230,6 +1260,7 @@ int main(int argc, char** argv) {
     world.sandMesh.destroy();
     world.palmMesh.destroy();
     world.lightMesh.destroy();
+    world.interiorMesh.destroy();
     glDeleteProgram(worldSh.id);
     glDeleteProgram(hudSh.id);
     glfwDestroyWindow(window);

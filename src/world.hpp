@@ -2,12 +2,21 @@
 #include <vector>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
+#include <algorithm>
 #include "mesh.hpp"
 #include "math.hpp"
+#include "shader.hpp"
 
 struct Building {
-    float x, z, w, d, h;
-    float r, g, b;
+    float x = 0, z = 0, w = 8, d = 8, h = 12;
+    float r = 0.8f, g = 0.8f, b = 0.8f;
+    bool enterable = false;
+    int floors = 1;       // interior levels
+    int doorSide = 0;     // 0=+Z facade
+    static constexpr float FLOOR_H = 3.2f;
+    static constexpr float WALL = 0.35f;
+    static constexpr float DOOR_W = 2.4f;
 };
 
 struct Prop {
@@ -17,7 +26,6 @@ struct Prop {
 };
 
 struct World {
-    // ~560m across city + beach/ocean beyond south edge
     static constexpr float CITY_HALF = 280.f;
     static constexpr float BLOCK = 32.f;
     static constexpr float ROAD = 10.f;
@@ -27,21 +35,87 @@ struct World {
     Mesh sandMesh;
     Mesh palmMesh;
     Mesh lightMesh;
+    Mesh interiorMesh; // all enterable interiors baked
     std::vector<Building> buildings;
     std::vector<Prop> props;
 
-    // Simple collision: axis-aligned building footprints
-    bool collides(float x, float z, float radius) const {
-        for (const auto& b : buildings) {
-            float hx = b.w * 0.5f + radius;
-            float hz = b.d * 0.5f + radius;
-            if (std::abs(x - b.x) < hx && std::abs(z - b.z) < hz)
-                return true;
+    // Player interior state (set by player movement)
+    // -1 = outdoors
+    int playerInterior = -1;
+    int playerFloor = 0;
+
+    bool inFootprint(const Building& b, float x, float z, float radius) const {
+        float hx = b.w * 0.5f + radius;
+        float hz = b.d * 0.5f + radius;
+        return std::abs(x - b.x) < hx && std::abs(z - b.z) < hz;
+    }
+
+    bool inDoorPortal(const Building& b, float x, float z, float radius) const {
+        if (!b.enterable) return false;
+        float x0 = b.x - b.w * 0.5f, x1 = b.x + b.w * 0.5f;
+        float z0 = b.z - b.d * 0.5f, z1 = b.z + b.d * 0.5f;
+        float halfDoor = Building::DOOR_W * 0.5f + radius;
+        // +Z face door
+        if (z > z1 - 1.2f - radius && z < z1 + 1.5f + radius &&
+            std::abs(x - b.x) < halfDoor)
+            return true;
+        // small inside threshold past door
+        if (z < z1 && z > z1 - 2.5f && std::abs(x - b.x) < halfDoor &&
+            x > x0 + Building::WALL && x < x1 - Building::WALL)
+            return true;
+        (void)z0;
+        return false;
+    }
+
+    // Wall shells for interior (true if hitting wall)
+    bool hitsInteriorWall(const Building& b, float x, float z, float radius) const {
+        float x0 = b.x - b.w * 0.5f + Building::WALL;
+        float x1 = b.x + b.w * 0.5f - Building::WALL;
+        float z0 = b.z - b.d * 0.5f + Building::WALL;
+        float z1 = b.z + b.d * 0.5f - Building::WALL;
+        // outside free space box = wall
+        bool inInner = x > x0 - radius && x < x1 + radius &&
+                       z > z0 - radius && z < z1 + radius;
+        if (!inInner) return true; // outside inner free → wall/shell
+        // door gap on +Z inner wall — allow exit
+        float halfDoor = Building::DOOR_W * 0.5f;
+        if (z > z1 - radius - 0.15f && std::abs(x - b.x) < halfDoor)
+            return false;
+        // stairs shaft free (SW corner)
+        float sx0 = x0, sx1 = x0 + 2.2f;
+        float sz0 = z0, sz1 = z0 + 2.2f;
+        if (x > sx0 && x < sx1 && z > sz0 && z < sz1) return false;
+        return false; // open floor plan interior
+    }
+
+    // forCar: solid footprints always. for player: door holes + interiors
+    bool collides(float x, float z, float radius, bool forCar = false) const {
+        for (int i = 0; i < (int)buildings.size(); ++i) {
+            const Building& b = buildings[i];
+            if (!inFootprint(b, x, z, radius)) continue;
+
+            if (forCar) return true; // cars never enter
+
+            if (playerInterior == i) {
+                // inside this building
+                if (hitsInteriorWall(b, x, z, radius)) return true;
+                continue;
+            }
+
+            // outdoors: solid unless door portal of enterable
+            if (b.enterable && inDoorPortal(b, x, z, radius))
+                continue;
+            return true;
         }
         return false;
     }
 
-    // Keep player/car in world bounds; beach is south (negative Z edge)
+    int buildingIndexAt(float x, float z) const {
+        for (int i = 0; i < (int)buildings.size(); ++i)
+            if (inFootprint(buildings[i], x, z, 0.f)) return i;
+        return -1;
+    }
+
     Vec3 clampPos(const Vec3& p) const {
         return {
             clampf(p.x, -CITY_HALF + 2.f, CITY_HALF - 2.f),
@@ -50,36 +124,96 @@ struct World {
         };
     }
 
-    float groundY(float /*x*/, float z) const {
-        // Beach slope into water south of city
+    float groundY(float x, float z) const {
+        if (playerInterior >= 0 && playerInterior < (int)buildings.size()) {
+            return playerFloor * Building::FLOOR_H;
+        }
         if (z < -CITY_HALF + 5.f) {
             float t = (-CITY_HALF + 5.f - z) / 25.f;
-            if (t > 1.f) return -0.5f; // underwater bed
+            if (t > 1.f) return -0.5f;
             return lerpf(0.f, -0.3f, t);
         }
+        (void)x;
         return 0.f;
     }
 
-    // True if point is on a road strip (safe spawn corridor)
+    // Update interior/floor from player position (call after move)
+    void updatePlayerInterior(float x, float z, float /*y*/) {
+        int bi = buildingIndexAt(x, z);
+        if (bi < 0) {
+            playerInterior = -1;
+            playerFloor = 0;
+            return;
+        }
+        const Building& b = buildings[bi];
+        if (!b.enterable) {
+            playerInterior = -1;
+            playerFloor = 0;
+            return;
+        }
+        // Enter if in door or already inside
+        float x0 = b.x - b.w * 0.5f + Building::WALL * 0.5f;
+        float x1 = b.x + b.w * 0.5f - Building::WALL * 0.5f;
+        float z0 = b.z - b.d * 0.5f + Building::WALL * 0.5f;
+        float z1 = b.z + b.d * 0.5f - Building::WALL * 0.5f;
+        bool deepInside = x > x0 && x < x1 && z > z0 && z < z1 - 0.3f;
+        if (playerInterior == bi || deepInside || inDoorPortal(b, x, z, 0.3f)) {
+            playerInterior = bi;
+            // stairs zone — SW corner
+            float sx0 = b.x - b.w * 0.5f + Building::WALL;
+            float sz0 = b.z - b.d * 0.5f + Building::WALL;
+            if (x > sx0 && x < sx0 + 2.2f && z > sz0 && z < sz0 + 2.2f) {
+                // sub-zones: lower half down, upper half up when moving
+                // continuous: map local z to floor via discrete steps on timer-less walk
+                // use position within stair: closer to outer = floor based on sub-rect
+            }
+        } else {
+            playerInterior = -1;
+            playerFloor = 0;
+        }
+    }
+
+    // Call when player is in stairs (returns true if floor changed)
+    bool tryUseStairs(float x, float z, bool wantUp) {
+        if (playerInterior < 0) return false;
+        const Building& b = buildings[playerInterior];
+        float sx0 = b.x - b.w * 0.5f + Building::WALL;
+        float sz0 = b.z - b.d * 0.5f + Building::WALL;
+        if (x < sx0 || x > sx0 + 2.4f || z < sz0 || z > sz0 + 2.4f) return false;
+        if (wantUp && playerFloor + 1 < b.floors) {
+            playerFloor++;
+            return true;
+        }
+        if (!wantUp && playerFloor > 0) {
+            playerFloor--;
+            return true;
+        }
+        return false;
+    }
+
     bool onRoad(float x, float z, float margin = 0.f) const {
         float half = ROAD * 0.5f - margin;
         if (half < 0.5f) half = 0.5f;
-        // Nearest vertical road (constant x = k*BLOCK)
         float nearestVx = std::round(x / BLOCK) * BLOCK;
         if (std::abs(x - nearestVx) <= half) return true;
-        // Nearest horizontal road (constant z = k*BLOCK)
         float nearestHz = std::round(z / BLOCK) * BLOCK;
         if (std::abs(z - nearestHz) <= half) return true;
         return false;
     }
 
-    // If inside a building, push out along the shortest axis (+ padding).
-    // If free, returns the point unchanged.
     Vec3 resolveSolid(float x, float z, float radius) const {
-        if (!collides(x, z, radius))
-            return Vec3(x, groundY(x, z), z);
+        // Always resolve as vehicle (push out of any footprint)
+        auto solidCollide = [&](float px, float pz) {
+            for (const auto& b : buildings) {
+                float hx = b.w * 0.5f + radius;
+                float hz = b.d * 0.5f + radius;
+                if (std::abs(px - b.x) < hx && std::abs(pz - b.z) < hz) return true;
+            }
+            return false;
+        };
+        if (!solidCollide(x, z))
+            return Vec3(x, 0.f, z);
 
-        // Push out of every overlapping building (usually one)
         for (int iter = 0; iter < 4; ++iter) {
             bool hit = false;
             for (const auto& b : buildings) {
@@ -92,69 +226,31 @@ struct World {
                 float penX = hx - std::abs(dx);
                 float penZ = hz - std::abs(dz);
                 const float pad = 0.35f;
-                if (penX < penZ) {
+                if (penX < penZ)
                     x = b.x + (dx >= 0.f ? hx + pad : -(hx + pad));
-                } else {
+                else
                     z = b.z + (dz >= 0.f ? hz + pad : -(hz + pad));
-                }
             }
             if (!hit) break;
         }
-
-        // Still stuck? Search outward for a free cell (roads first)
-        if (collides(x, z, radius)) {
-            const float steps[] = {2.f, 4.f, 6.f, 8.f, 12.f, 16.f, 24.f};
-            const float dirs[8][2] = {
-                {1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}
-            };
-            bool found = false;
-            float bx = x, bz = z;
-            for (float s : steps) {
-                for (auto& d : dirs) {
-                    float nx = x + d[0] * s;
-                    float nz = z + d[1] * s;
-                    if (!collides(nx, nz, radius)) {
-                        bx = nx; bz = nz; found = true; break;
-                    }
-                }
-                if (found) break;
-            }
-            if (found) { x = bx; z = bz; }
-            else {
-                // Last resort: origin intersection (always a road cross)
-                x = 0.f; z = 0.f;
-            }
+        if (solidCollide(x, z)) {
+            x = 0.f; z = 0.f;
         }
-
         Vec3 p = clampPos(Vec3(x, 0.f, z));
-        p.y = groundY(p.x, p.z);
+        p.y = 0.f;
         return p;
     }
 
-    // Prefer a clear spot on the road grid near a preferred position
     Vec3 findClearSpawn(float preferX, float preferZ, float radius = 0.5f) const {
-        // Snap toward nearest road centerline
         float vx = std::round(preferX / BLOCK) * BLOCK;
         float hz = std::round(preferZ / BLOCK) * BLOCK;
-        // Try intersection, then along both roads
         const float candidates[][2] = {
-            {vx, hz},
-            {vx, preferZ},
-            {preferX, hz},
-            {0.f, 0.f},
-            {0.f, BLOCK},
-            {BLOCK, 0.f},
-            {-BLOCK, 0.f},
-            {0.f, -BLOCK},
-            {vx, hz + ROAD},
-            {vx, hz - ROAD},
-            {vx + ROAD, hz},
-            {vx - ROAD, hz},
+            {vx, hz}, {0.f, 0.f}, {0.f, BLOCK}, {BLOCK, 0.f}, {-BLOCK, 0.f},
         };
         for (auto& c : candidates) {
-            if (!collides(c[0], c[1], radius)) {
+            if (!collides(c[0], c[1], radius, true)) {
                 Vec3 p = clampPos(Vec3(c[0], 0.f, c[1]));
-                p.y = groundY(p.x, p.z);
+                p.y = 0.f;
                 return p;
             }
         }
@@ -166,29 +262,18 @@ struct World {
         auto rnd = []() { return (std::rand() % 10000) / 10000.f; };
         auto rndRange = [&](float a, float b) { return a + rnd() * (b - a); };
 
-        // Vice City / Leonida palette
         const float palette[][3] = {
-            {0.95f, 0.55f, 0.65f}, // coral pink
-            {0.35f, 0.75f, 0.85f}, // teal
-            {0.98f, 0.85f, 0.45f}, // sunny yellow
-            {0.55f, 0.45f, 0.85f}, // lavender
-            {0.95f, 0.7f, 0.4f},   // peach
-            {0.4f, 0.55f, 0.7f},   // art deco blue
-            {0.9f, 0.9f, 0.92f},   // white stucco
-            {0.3f, 0.65f, 0.55f},  // mint
+            {0.95f, 0.55f, 0.65f}, {0.35f, 0.75f, 0.85f}, {0.98f, 0.85f, 0.45f},
+            {0.55f, 0.45f, 0.85f}, {0.95f, 0.7f, 0.4f}, {0.4f, 0.55f, 0.7f},
+            {0.9f, 0.9f, 0.92f}, {0.3f, 0.65f, 0.55f},
         };
 
-        std::vector<Vertex> verts;
-        std::vector<unsigned> idx;
-
-        // Asphalt roads + sidewalks + grass lots
-        // Grid: road every BLOCK
+        std::vector<Vertex> verts, iverts;
+        std::vector<unsigned> idx, iidx;
         int n = static_cast<int>((CITY_HALF * 2.f) / BLOCK);
-
-        // Sidewalk width between asphalt and lots
         const float curb = 1.4f;
+        int enterableCount = 0;
 
-        // Base grass + buildings
         for (int iz = -n; iz < n; ++iz) {
             for (int ix = -n; ix < n; ++ix) {
                 float cx = (ix + 0.5f) * BLOCK;
@@ -198,7 +283,6 @@ struct World {
                 float gx0 = cx - halfLot, gx1 = cx + halfLot;
                 float gz0 = cz - halfLot, gz1 = cz + halfLot;
 
-                // Checker grass tiles for more ground detail
                 const int gdiv = 2;
                 float gstepX = (gx1 - gx0) / gdiv;
                 float gstepZ = (gz1 - gz0) / gdiv;
@@ -211,22 +295,11 @@ struct World {
                                 0.20f * t, 0.52f * t, 0.26f * t, 0.03f);
                     }
                 }
+                pushBox(verts, idx, gx0 - curb, 0.02f, gz0 - curb, gx1 + curb, 0.05f, gz0, 0.72f, 0.72f, 0.7f, 0.02f);
+                pushBox(verts, idx, gx0 - curb, 0.02f, gz1, gx1 + curb, 0.05f, gz1 + curb, 0.72f, 0.72f, 0.7f, 0.02f);
+                pushBox(verts, idx, gx0 - curb, 0.02f, gz0, gx0, 0.05f, gz1, 0.7f, 0.7f, 0.68f, 0.02f);
+                pushBox(verts, idx, gx1, 0.02f, gz0, gx1 + curb, 0.05f, gz1, 0.7f, 0.7f, 0.68f, 0.02f);
 
-                // Concrete sidewalk ring around lot (visual only)
-                pushBox(verts, idx,
-                        gx0 - curb, 0.02f, gz0 - curb, gx1 + curb, 0.05f, gz0,
-                        0.72f, 0.72f, 0.7f, 0.02f);
-                pushBox(verts, idx,
-                        gx0 - curb, 0.02f, gz1, gx1 + curb, 0.05f, gz1 + curb,
-                        0.72f, 0.72f, 0.7f, 0.02f);
-                pushBox(verts, idx,
-                        gx0 - curb, 0.02f, gz0, gx0, 0.05f, gz1,
-                        0.7f, 0.7f, 0.68f, 0.02f);
-                pushBox(verts, idx,
-                        gx1, 0.02f, gz0, gx1 + curb, 0.05f, gz1,
-                        0.7f, 0.7f, 0.68f, 0.02f);
-
-                // Buildings — keep sidewalk gap so footprints never eat the road
                 if (rnd() > 0.14f) {
                     Building b;
                     const float inset = 2.4f;
@@ -240,188 +313,187 @@ struct World {
                     b.z = cz + rndRange(-maxOffZ, maxOffZ);
                     b.h = rndRange(8.f, 32.f + rnd() * 22.f);
                     float dist = std::sqrt(b.x * b.x + b.z * b.z);
-                    if (dist < 60.f) b.h += rndRange(12.f, 45.f);       // downtown towers
-                    else if (dist < 140.f) b.h += rndRange(4.f, 18.f);  // midtown
+                    if (dist < 60.f) b.h += rndRange(12.f, 45.f);
+                    else if (dist < 140.f) b.h += rndRange(4.f, 18.f);
                     int pi = std::rand() % 8;
-                    b.r = palette[pi][0];
-                    b.g = palette[pi][1];
-                    b.b = palette[pi][2];
-                    buildings.push_back(b);
+                    b.r = palette[pi][0]; b.g = palette[pi][1]; b.b = palette[pi][2];
 
+                    // Enterable mid-size buildings near center (limit count for perf)
+                    int maxFloors = std::max(2, std::min(5, (int)(b.h / Building::FLOOR_H)));
+                    if (enterableCount < 18 && dist < 90.f && b.w > 8.f && b.d > 8.f && rnd() > 0.35f) {
+                        b.enterable = true;
+                        b.floors = std::min(maxFloors, 2 + (std::rand() % 3)); // 2–4 floors
+                        b.doorSide = 0;
+                        enterableCount++;
+                    }
+
+                    buildings.push_back(b);
                     float x0 = b.x - b.w * 0.5f, x1 = b.x + b.w * 0.5f;
                     float z0 = b.z - b.d * 0.5f, z1 = b.z + b.d * 0.5f;
 
-                    // Main body
-                    pushBox(verts, idx, x0, 0.f, z0, x1, b.h, z1, b.r, b.g, b.b, 0.1f);
+                    if (!b.enterable) {
+                        pushBox(verts, idx, x0, 0.f, z0, x1, b.h, z1, b.r, b.g, b.b, 0.1f);
+                    } else {
+                        // Hollow exterior shell + door cut on +Z
+                        float wt = Building::WALL;
+                        float doorHalf = Building::DOOR_W * 0.5f;
+                        // -Z wall
+                        pushBox(verts, idx, x0, 0.f, z0, x1, b.h, z0 + wt, b.r, b.g, b.b, 0.1f);
+                        // +Z wall with door gap (two sides + lintel)
+                        pushBox(verts, idx, x0, 0.f, z1 - wt, b.x - doorHalf, 2.4f, z1, b.r, b.g, b.b, 0.1f);
+                        pushBox(verts, idx, b.x + doorHalf, 0.f, z1 - wt, x1, 2.4f, z1, b.r, b.g, b.b, 0.1f);
+                        pushBox(verts, idx, x0, 2.4f, z1 - wt, x1, b.h, z1, b.r, b.g, b.b, 0.1f);
+                        // door frame accent
+                        pushBox(verts, idx, b.x - doorHalf - 0.12f, 0.f, z1 - 0.05f,
+                                b.x - doorHalf, 2.4f, z1 + 0.12f, 0.35f, 0.25f, 0.15f, 0.f);
+                        pushBox(verts, idx, b.x + doorHalf, 0.f, z1 - 0.05f,
+                                b.x + doorHalf + 0.12f, 2.4f, z1 + 0.12f, 0.35f, 0.25f, 0.15f, 0.f);
+                        // ±X walls
+                        pushBox(verts, idx, x0, 0.f, z0, x0 + wt, b.h, z1, b.r * 0.95f, b.g * 0.95f, b.b * 0.95f, 0.1f);
+                        pushBox(verts, idx, x1 - wt, 0.f, z0, x1, b.h, z1, b.r * 0.95f, b.g * 0.95f, b.b * 0.95f, 0.1f);
+                        // roof
+                        pushBox(verts, idx, x0 - 0.2f, b.h, z0 - 0.2f, x1 + 0.2f, b.h + 0.5f, z1 + 0.2f,
+                                b.r * 0.5f, b.g * 0.5f, b.b * 0.55f, 0.04f);
 
-                    // Ground floor darker plinth
-                    pushBox(verts, idx, x0 - 0.08f, 0.f, z0 - 0.08f, x1 + 0.08f, 3.2f, z1 + 0.08f,
-                            b.r * 0.75f, b.g * 0.75f, b.b * 0.78f, 0.06f);
+                        // ---- Interiors per floor ----
+                        for (int f = 0; f < b.floors; ++f) {
+                            float y0 = f * Building::FLOOR_H;
+                            float y1 = y0 + Building::FLOOR_H;
+                            // floor slab
+                            pushBox(iverts, iidx, x0 + wt, y0, z0 + wt, x1 - wt, y0 + 0.12f, z1 - wt,
+                                    0.55f, 0.5f, 0.45f, 0.03f);
+                            // ceiling (except top)
+                            if (f + 1 < b.floors)
+                                pushBox(iverts, iidx, x0 + wt, y1 - 0.12f, z0 + wt, x1 - wt, y1, z1 - wt,
+                                        0.75f, 0.72f, 0.7f, 0.02f);
+                            // interior wall color
+                            float ir = b.r * 0.85f + 0.1f, ig = b.g * 0.85f + 0.1f, ib = b.b * 0.85f + 0.12f;
+                            pushBox(iverts, iidx, x0 + wt, y0, z0 + wt, x1 - wt, y1, z0 + wt + 0.08f, ir, ig, ib, 0.05f);
+                            // +Z interior wall with door cut on ground only
+                            if (f == 0) {
+                                pushBox(iverts, iidx, x0 + wt, y0, z1 - wt - 0.08f, b.x - doorHalf, y1, z1 - wt, ir, ig, ib, 0.05f);
+                                pushBox(iverts, iidx, b.x + doorHalf, y0, z1 - wt - 0.08f, x1 - wt, y1, z1 - wt, ir, ig, ib, 0.05f);
+                                pushBox(iverts, iidx, x0 + wt, 2.4f, z1 - wt - 0.08f, x1 - wt, y1, z1 - wt, ir, ig, ib, 0.05f);
+                            } else {
+                                pushBox(iverts, iidx, x0 + wt, y0, z1 - wt - 0.08f, x1 - wt, y1, z1 - wt, ir, ig, ib, 0.05f);
+                            }
+                            pushBox(iverts, iidx, x0 + wt, y0, z0 + wt, x0 + wt + 0.08f, y1, z1 - wt, ir * 0.95f, ig * 0.95f, ib * 0.95f, 0.05f);
+                            pushBox(iverts, iidx, x1 - wt - 0.08f, y0, z0 + wt, x1 - wt, y1, z1 - wt, ir * 0.95f, ig * 0.95f, ib * 0.95f, 0.05f);
 
-                    // Roof parapet
-                    pushBox(verts, idx, x0 - 0.25f, b.h, z0 - 0.25f, x1 + 0.25f, b.h + 0.55f, z1 + 0.25f,
-                            b.r * 0.5f, b.g * 0.5f, b.b * 0.55f, 0.04f);
-                    // Roof deck
-                    pushBox(verts, idx, x0 + 0.3f, b.h + 0.55f, z0 + 0.3f, x1 - 0.3f, b.h + 0.7f, z1 - 0.3f,
-                            0.35f, 0.35f, 0.38f, 0.02f);
+                            // stairs in SW corner
+                            float sx = x0 + wt + 0.3f;
+                            float sz = z0 + wt + 0.3f;
+                            for (int step = 0; step < 8; ++step) {
+                                float sy = y0 + step * (Building::FLOOR_H / 8.f);
+                                pushBox(iverts, iidx, sx, sy, sz + step * 0.22f,
+                                        sx + 1.6f, sy + 0.18f, sz + step * 0.22f + 0.22f,
+                                        0.5f, 0.45f, 0.4f, 0.02f);
+                            }
+                            // rail
+                            pushBox(iverts, iidx, sx + 1.55f, y0, sz, sx + 1.65f, y1, sz + 1.8f, 0.3f, 0.3f, 0.32f, 0.f);
 
-                    // Window grid (every other floor + 2 facades to keep mesh budget sane)
-                    int floors = std::max(2, static_cast<int>(b.h / 3.1f));
-                    int colsX = std::max(2, static_cast<int>(b.w / 2.6f));
-                    int colsZ = std::max(2, static_cast<int>(b.d / 2.6f));
-                    for (int f = 1; f < floors; f += 1) {
-                        float y0 = f * 3.1f + 0.35f;
-                        float y1 = y0 + 1.25f;
-                        float lit = (rnd() > 0.5f) ? 1.f : 0.5f;
-                        float wr = (0.45f + 0.4f * rnd()) * lit;
-                        float wg = (0.55f + 0.3f * rnd()) * lit;
-                        float wb = (0.7f + 0.25f * rnd()) * lit;
-                        // +Z and +X primary facades
-                        for (int c = 0; c < colsX; ++c) {
-                            float u0 = x0 + 0.45f + c * (b.w - 0.9f) / colsX;
-                            float u1 = u0 + (b.w - 0.9f) / colsX * 0.5f;
-                            pushBox(verts, idx, u0, y0, z1 - 0.04f, u1, y1, z1 + 0.09f, wr, wg, wb, 0.f);
+                            // furniture layout varies by floor
+                            int kindA = f % 5;
+                            int kindB = (f + 2) % 5;
+                            pushFurniture(iverts, iidx, b.x + 1.5f, y0 + 0.12f, b.z, kindA);
+                            pushFurniture(iverts, iidx, b.x - 1.8f, y0 + 0.12f, b.z - 1.2f, kindB);
+                            pushFurniture(iverts, iidx, b.x + 0.5f, y0 + 0.12f, b.z + b.d * 0.15f, 4);
+                            // rug
+                            pushBox(iverts, iidx, b.x - 1.5f, y0 + 0.13f, b.z - 1.0f,
+                                    b.x + 1.5f, y0 + 0.16f, b.z + 1.0f,
+                                    0.6f + 0.1f * (f % 3), 0.25f, 0.35f, 0.f);
+                            // ceiling light
+                            pushBox(iverts, iidx, b.x - 0.3f, y1 - 0.25f, b.z - 0.3f,
+                                    b.x + 0.3f, y1 - 0.05f, b.z + 0.3f, 1.f, 0.95f, 0.7f, 0.f);
                         }
-                        for (int c = 0; c < colsZ; ++c) {
-                            float u0 = z0 + 0.45f + c * (b.d - 0.9f) / colsZ;
-                            float u1 = u0 + (b.d - 0.9f) / colsZ * 0.5f;
-                            pushBox(verts, idx, x1 - 0.04f, y0, u0, x1 + 0.09f, y1, u1, wr * 0.95f, wg * 0.95f, wb, 0.f);
-                        }
-                        // Alternate floors get the other two facades
-                        if ((f & 1) == 0) {
+                    }
+
+                    // windows on solid buildings
+                    if (!b.enterable) {
+                        pushBox(verts, idx, x0 - 0.08f, 0.f, z0 - 0.08f, x1 + 0.08f, 3.2f, z1 + 0.08f,
+                                b.r * 0.75f, b.g * 0.75f, b.b * 0.78f, 0.06f);
+                        pushBox(verts, idx, x0 - 0.25f, b.h, z0 - 0.25f, x1 + 0.25f, b.h + 0.55f, z1 + 0.25f,
+                                b.r * 0.5f, b.g * 0.5f, b.b * 0.55f, 0.04f);
+                        int floors = std::max(2, static_cast<int>(b.h / 3.1f));
+                        int colsX = std::max(2, static_cast<int>(b.w / 2.6f));
+                        for (int f = 1; f < floors; f++) {
+                            float y0 = f * 3.1f + 0.35f, y1 = y0 + 1.25f;
+                            float wr = 0.55f + 0.3f * rnd();
                             for (int c = 0; c < colsX; ++c) {
                                 float u0 = x0 + 0.45f + c * (b.w - 0.9f) / colsX;
                                 float u1 = u0 + (b.w - 0.9f) / colsX * 0.5f;
-                                pushBox(verts, idx, u0, y0, z0 - 0.09f, u1, y1, z0 + 0.04f,
-                                        wr * 0.9f, wg * 0.9f, wb * 0.95f, 0.f);
+                                pushBox(verts, idx, u0, y0, z1 - 0.04f, u1, y1, z1 + 0.09f, wr, wr + 0.1f, wr + 0.2f, 0.f);
+                            }
+                        }
+                    } else {
+                        // windows above door floor
+                        float dHalf = Building::DOOR_W * 0.5f;
+                        int colsX = std::max(2, static_cast<int>(b.w / 2.6f));
+                        for (int f = 1; f < b.floors + 2; f++) {
+                            float y0 = f * 3.1f + 0.35f, y1 = y0 + 1.15f;
+                            if (y1 > b.h) break;
+                            for (int c = 0; c < colsX; ++c) {
+                                float u0 = x0 + 0.45f + c * (b.w - 0.9f) / colsX;
+                                float u1 = u0 + (b.w - 0.9f) / colsX * 0.5f;
+                                if (std::abs((u0 + u1) * 0.5f - b.x) < dHalf + 0.5f && f == 1) continue;
+                                pushBox(verts, idx, u0, y0, z1 - 0.02f, u1, y1, z1 + 0.08f, 0.5f, 0.65f, 0.8f, 0.f);
                             }
                         }
                     }
-
-                    // Occasional rooftop billboard / AC unit
-                    if (rnd() > 0.65f) {
-                        pushBox(verts, idx,
-                                b.x - 1.2f, b.h + 0.7f, b.z - 0.4f,
-                                b.x + 1.2f, b.h + 3.2f, b.z + 0.4f,
-                                rndRange(0.8f, 1.f), rndRange(0.2f, 0.6f), rndRange(0.5f, 1.f), 0.05f);
-                    }
                 }
 
-                // Palms on lot corners
                 if (rnd() > 0.4f)
                     props.push_back({cx - halfLot + 1.8f, cz - halfLot + 1.8f, rndRange(0.9f, 1.35f), 0});
                 if (rnd() > 0.55f)
                     props.push_back({cx + halfLot - 1.8f, cz + halfLot - 1.8f, rndRange(0.9f, 1.35f), 0});
-                if (rnd() > 0.75f)
-                    props.push_back({cx - halfLot + 1.8f, cz + halfLot - 1.8f, rndRange(0.85f, 1.2f), 0});
             }
         }
 
-        // Roads: asphalt + curbs + continuous lane markings (cheap & sharp)
         for (int i = -n; i <= n; ++i) {
             float c = i * BLOCK;
             float rh = ROAD * 0.5f;
-            // Vertical road
-            pushBox(verts, idx, c - rh, -0.02f, -CITY_HALF, c + rh, 0.03f, CITY_HALF,
-                    0.16f, 0.16f, 0.18f, 0.02f);
-            // Horizontal road
-            pushBox(verts, idx, -CITY_HALF, -0.02f, c - rh, CITY_HALF, 0.03f, c + rh,
-                    0.16f, 0.16f, 0.18f, 0.02f);
-            // White edge lines
-            pushBox(verts, idx, c - rh + 0.15f, 0.035f, -CITY_HALF, c - rh + 0.35f, 0.042f, CITY_HALF,
-                    0.92f, 0.92f, 0.9f, 0.f);
-            pushBox(verts, idx, c + rh - 0.35f, 0.035f, -CITY_HALF, c + rh - 0.15f, 0.042f, CITY_HALF,
-                    0.92f, 0.92f, 0.9f, 0.f);
-            pushBox(verts, idx, -CITY_HALF, 0.035f, c - rh + 0.15f, CITY_HALF, 0.042f, c - rh + 0.35f,
-                    0.92f, 0.92f, 0.9f, 0.f);
-            pushBox(verts, idx, -CITY_HALF, 0.035f, c + rh - 0.35f, CITY_HALF, 0.042f, c + rh - 0.15f,
-                    0.92f, 0.92f, 0.9f, 0.f);
-            // Double yellow center (two thin strips)
-            pushBox(verts, idx, c - 0.18f, 0.036f, -CITY_HALF, c - 0.06f, 0.044f, CITY_HALF,
-                    0.95f, 0.82f, 0.15f, 0.f);
-            pushBox(verts, idx, c + 0.06f, 0.036f, -CITY_HALF, c + 0.18f, 0.044f, CITY_HALF,
-                    0.95f, 0.82f, 0.15f, 0.f);
-            pushBox(verts, idx, -CITY_HALF, 0.036f, c - 0.18f, CITY_HALF, 0.044f, c - 0.06f,
-                    0.95f, 0.82f, 0.15f, 0.f);
-            pushBox(verts, idx, -CITY_HALF, 0.036f, c + 0.06f, CITY_HALF, 0.044f, c + 0.18f,
-                    0.95f, 0.82f, 0.15f, 0.f);
+            pushBox(verts, idx, c - rh, -0.02f, -CITY_HALF, c + rh, 0.03f, CITY_HALF, 0.16f, 0.16f, 0.18f, 0.02f);
+            pushBox(verts, idx, -CITY_HALF, -0.02f, c - rh, CITY_HALF, 0.03f, c + rh, 0.16f, 0.16f, 0.18f, 0.02f);
+            pushBox(verts, idx, c - 0.18f, 0.036f, -CITY_HALF, c - 0.06f, 0.044f, CITY_HALF, 0.95f, 0.82f, 0.15f, 0.f);
+            pushBox(verts, idx, c + 0.06f, 0.036f, -CITY_HALF, c + 0.18f, 0.044f, CITY_HALF, 0.95f, 0.82f, 0.15f, 0.f);
         }
 
-        // Beach boardwalk / multi-band sand
-        pushBox(verts, idx,
-                -CITY_HALF - 10.f, -0.08f, -CITY_HALF - 2.f,
-                CITY_HALF + 10.f, 0.06f, -CITY_HALF + 8.f,
+        pushBox(verts, idx, -CITY_HALF - 10.f, -0.08f, -CITY_HALF - 2.f, CITY_HALF + 10.f, 0.06f, -CITY_HALF + 8.f,
                 0.92f, 0.82f, 0.58f, 0.04f);
-        pushBox(verts, idx,
-                -CITY_HALF - 10.f, -0.12f, -CITY_HALF - 18.f,
-                CITY_HALF + 10.f, 0.02f, -CITY_HALF - 2.f,
-                0.88f, 0.76f, 0.5f, 0.04f);
-        // Boardwalk planks strip
-        pushBox(verts, idx,
-                -CITY_HALF, 0.06f, -CITY_HALF + 5.5f,
-                CITY_HALF, 0.12f, -CITY_HALF + 7.5f,
-                0.55f, 0.38f, 0.22f, 0.03f);
-
-        // Dense beach palms
-        for (float x = -CITY_HALF + 4.f; x < CITY_HALF; x += 8.f) {
-            props.push_back({x + rndRange(-1.5f, 1.5f), -CITY_HALF + 3.f + rndRange(0.f, 4.f),
-                             rndRange(1.0f, 1.5f), 0});
-            if (rnd() > 0.5f)
-                props.push_back({x + rndRange(-2.f, 2.f), -CITY_HALF + 1.f + rndRange(0.f, 2.f),
-                                 rndRange(0.85f, 1.2f), 0});
-        }
+        for (float x = -CITY_HALF + 4.f; x < CITY_HALF; x += 8.f)
+            props.push_back({x + rndRange(-1.5f, 1.5f), -CITY_HALF + 3.f, rndRange(1.0f, 1.5f), 0});
 
         cityMesh.upload(verts, idx);
+        interiorMesh.upload(iverts, iidx);
 
-        // Layered ocean (near + mid + far)
         {
-            std::vector<Vertex> wv;
-            std::vector<unsigned> wi;
-            pushBox(wv, wi,
-                    -CITY_HALF - 60.f, -0.35f, -CITY_HALF - 100.f,
-                    CITY_HALF + 60.f, -0.12f, -CITY_HALF + 2.f,
+            std::vector<Vertex> wv; std::vector<unsigned> wi;
+            pushBox(wv, wi, -CITY_HALF - 60.f, -0.35f, -CITY_HALF - 100.f, CITY_HALF + 60.f, -0.12f, -CITY_HALF + 2.f,
                     0.12f, 0.58f, 0.78f, 0.03f);
-            pushBox(wv, wi,
-                    -CITY_HALF - 120.f, -0.45f, -CITY_HALF - 220.f,
-                    CITY_HALF + 120.f, -0.18f, -CITY_HALF - 90.f,
+            pushBox(wv, wi, -CITY_HALF - 120.f, -0.45f, -CITY_HALF - 220.f, CITY_HALF + 120.f, -0.18f, -CITY_HALF - 90.f,
                     0.06f, 0.4f, 0.68f, 0.02f);
-            pushBox(wv, wi,
-                    -CITY_HALF - 200.f, -0.55f, -CITY_HALF - 360.f,
-                    CITY_HALF + 200.f, -0.22f, -CITY_HALF - 200.f,
-                    0.03f, 0.28f, 0.55f, 0.02f);
             waterMesh.upload(wv, wi);
         }
-
         {
-            std::vector<Vertex> sv;
-            std::vector<unsigned> si;
-            pushBox(sv, si,
-                    -CITY_HALF - 8.f, -0.18f, -CITY_HALF - 45.f,
-                    CITY_HALF + 8.f, 0.0f, -CITY_HALF - 1.f,
+            std::vector<Vertex> sv; std::vector<unsigned> si;
+            pushBox(sv, si, -CITY_HALF - 8.f, -0.18f, -CITY_HALF - 45.f, CITY_HALF + 8.f, 0.f, -CITY_HALF - 1.f,
                     0.9f, 0.8f, 0.55f, 0.04f);
             sandMesh.upload(sv, si);
         }
-
         palmMesh = makePalmMesh();
-
         {
-            std::vector<Vertex> lv;
-            std::vector<unsigned> li;
+            std::vector<Vertex> lv; std::vector<unsigned> li;
             pushBox(lv, li, -0.1f, 0, -0.1f, 0.1f, 5.4f, 0.1f, 0.22f, 0.22f, 0.25f);
             pushBox(lv, li, -0.55f, 5.1f, -0.12f, 0.55f, 5.45f, 0.12f, 0.28f, 0.28f, 0.3f);
             pushBox(lv, li, -0.28f, 5.0f, -0.28f, 0.28f, 5.35f, 0.28f, 1.f, 0.95f, 0.72f);
             lightMesh.upload(lv, li);
         }
-
-        // Street lights on every road, denser spacing
         for (int i = -n; i <= n; ++i) {
             float c = i * BLOCK;
-            for (float z = -CITY_HALF + 8.f; z < CITY_HALF; z += 22.f) {
+            for (float z = -CITY_HALF + 8.f; z < CITY_HALF; z += 22.f)
                 props.push_back({c + ROAD * 0.42f, z, 1.f, 1});
-                if ((i & 1) == 0)
-                    props.push_back({c - ROAD * 0.42f, z + 11.f, 1.f, 1});
-            }
         }
+        std::fprintf(stderr, "World: %d enterable buildings with interiors\n", enterableCount);
     }
 
     void drawStatic(const Shader& sh, const Mat4& view, const Mat4& proj) const {
@@ -431,7 +503,8 @@ struct World {
         sh.setMat4("uProj", proj);
         cityMesh.draw();
         sandMesh.draw();
-        // waterMesh drawn separately with animated shader mode
+        // interiors always drawn (inside hollow shells)
+        interiorMesh.draw();
 
         for (const auto& p : props) {
             if (p.type == 0) {
