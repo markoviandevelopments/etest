@@ -16,8 +16,9 @@ struct Camera {
     Vec3 position{0, 5, -9};
 
     void orbit(float dx, float dy) {
-        // mouse right → look right (increase yaw toward +X)
-        yaw += dx * mouseSens;
+        // Mouse left (dx < 0) → look left; mouse right → look right.
+        // Facing +Z, left is +X which is +yaw, so subtract dx.
+        yaw -= dx * mouseSens;
         pitch += dy * mouseSens;
         pitch = clampf(pitch, 0.05f, 1.25f);
     }

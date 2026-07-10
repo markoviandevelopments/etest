@@ -356,13 +356,29 @@ int main(int argc, char** argv) {
 
                     if (c.in_vehicle && c.vehicle_id >= 0) {
                         int vi = findVehicle(vehicles, c.vehicle_id);
-                        if (vi >= 0 && vehicles[vi].owner == static_cast<int32_t>(c.id)) {
-                            vehicles[vi].x = st.vx;
-                            vehicles[vi].y = st.vy;
-                            vehicles[vi].z = st.vz;
-                            vehicles[vi].yaw = st.v_yaw;
-                            vehicles[vi].speed = st.v_speed;
+                        if (vi >= 0) {
+                            // Auto-claim if free (ENTER may have been lost / raced with snapshot)
+                            if (vehicles[vi].owner < 0) {
+                                freeVehiclesOwnedBy(vehicles, static_cast<int32_t>(c.id));
+                                vehicles[vi].owner = static_cast<int32_t>(c.id);
+                                std::cout << "[=] player " << c.id
+                                          << " auto-claimed vehicle " << c.vehicle_id << "\n";
+                            }
+                            if (vehicles[vi].owner == static_cast<int32_t>(c.id)) {
+                                vehicles[vi].x = st.vx;
+                                vehicles[vi].y = st.vy;
+                                vehicles[vi].z = st.vz;
+                                vehicles[vi].yaw = st.v_yaw;
+                                vehicles[vi].speed = st.v_speed;
+                            } else {
+                                // Someone else has this car — clear client's claim
+                                c.in_vehicle = 0;
+                                c.vehicle_id = -1;
+                            }
                         }
+                    } else if (!c.in_vehicle) {
+                        // Ensure we don't keep ownership after client exited without C_EXIT
+                        // (only clear if they were sole owner of something — handled by C_EXIT)
                     }
                 } else if (type == C_ENTER && c.welcomed) {
                     if (payload.size() < sizeof(int32_t)) continue;
@@ -370,20 +386,23 @@ int main(int argc, char** argv) {
                     std::memcpy(&vid, payload.data(), sizeof(vid));
                     int vi = findVehicle(vehicles, vid);
                     if (vi < 0) continue;
-                    // Must be free and somewhat near player
+                    // Distance vs last known client pos OR vehicle (lenient — client is authority)
                     float dx = vehicles[vi].x - c.x;
                     float dz = vehicles[vi].z - c.z;
                     float dist = std::sqrt(dx * dx + dz * dz);
-                    if (vehicles[vi].owner < 0 && dist < 12.f) {
-                        // release any previous
+                    bool free = vehicles[vi].owner < 0;
+                    bool alreadyUs = vehicles[vi].owner == static_cast<int32_t>(c.id);
+                    if ((free || alreadyUs) && dist < 40.f) {
                         freeVehiclesOwnedBy(vehicles, static_cast<int32_t>(c.id));
                         vehicles[vi].owner = static_cast<int32_t>(c.id);
                         vehicles[vi].speed = 0;
                         c.in_vehicle = 1;
                         c.vehicle_id = vid;
-                        c.x = vehicles[vi].x;
-                        c.z = vehicles[vi].z;
+                        // Don't snap player on server — client drives
                         std::cout << "[=] player " << c.id << " entered vehicle " << vid << "\n";
+                    } else {
+                        std::cout << "[!] enter denied id=" << c.id << " veh=" << vid
+                                  << " free=" << free << " dist=" << dist << "\n";
                     }
                 } else if (type == C_EXIT && c.welcomed) {
                     freeVehiclesOwnedBy(vehicles, static_cast<int32_t>(c.id));

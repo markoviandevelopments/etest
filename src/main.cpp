@@ -752,18 +752,38 @@ int main(int argc, char** argv) {
                             if (idx >= (int)vehOwner.size()) vehOwner.resize(idx + 1, -1);
                             vehOwner[idx] = vs.owner;
 
-                            bool localOwns = (vs.owner == (int32_t)net.localId);
-                            // Apply remote / AI vehicles from server; keep local prediction if we own
-                            applyVehicleSnap(cars[idx], vs, !localOwns);
-                            cars[idx].ai = false; // server simulates AI
-                            if (!localOwns && player.inVehicle && player.vehicleIndex == idx) {
-                                // lost ownership
+                            const bool weAreDriving =
+                                player.inVehicle && player.vehicleIndex == idx;
+                            const bool serverSaysUs =
+                                vs.owner == (int32_t)net.localId;
+                            const bool serverSaysOther =
+                                vs.owner >= 0 && vs.owner != (int32_t)net.localId;
+
+                            // Only lose the seat if another player claimed this car.
+                            // Free (owner -1) must NOT eject us — ENTER may still be in flight,
+                            // and we keep client-side prediction until the server confirms.
+                            if (weAreDriving && serverSaysOther) {
                                 player.inVehicle = false;
                                 player.vehicleIndex = -1;
-                                cars[idx].occupied = vs.owner >= 0;
-                            }
-                            if (localOwns) {
+                                applyVehicleSnap(cars[idx], vs, true);
+                                cars[idx].ai = false;
                                 cars[idx].occupied = true;
+                                continue;
+                            }
+
+                            if (weAreDriving || serverSaysUs) {
+                                // Local authority while seated / confirmed owner
+                                cars[idx].occupied = true;
+                                cars[idx].ai = false;
+                                cars[idx].r = vs.r;
+                                cars[idx].g = vs.g;
+                                cars[idx].b = vs.b;
+                                // If server still shows free, re-request enter while driving
+                                if (weAreDriving && vs.owner < 0)
+                                    net.sendEnter(idx);
+                            } else {
+                                // Remote / AI vehicle from server
+                                applyVehicleSnap(cars[idx], vs, true);
                                 cars[idx].ai = false;
                             }
                         }
