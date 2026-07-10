@@ -732,6 +732,7 @@ int main(int argc, char** argv) {
                 float throttle = 0.f, steer = 0.f;
                 if (gKeys[GLFW_KEY_W] || gKeys[GLFW_KEY_UP]) throttle += 1.f;
                 if (gKeys[GLFW_KEY_S] || gKeys[GLFW_KEY_DOWN]) throttle -= 1.f;
+                // A = left (negative steer), D = right (positive steer)
                 if (gKeys[GLFW_KEY_A] || gKeys[GLFW_KEY_LEFT]) steer -= 1.f;
                 if (gKeys[GLFW_KEY_D] || gKeys[GLFW_KEY_RIGHT]) steer += 1.f;
                 if (gKeys[GLFW_KEY_SPACE]) v.speed *= (1.f - 3.f * dt);

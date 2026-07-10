@@ -50,8 +50,8 @@ struct Client {
     double lastHeard = 0.0;
 };
 
-static constexpr float CITY_HALF = 120.f;
-static constexpr float BLOCK = 24.f;
+static constexpr float CITY_HALF = 280.f;
+static constexpr float BLOCK = 32.f;
 
 static float clampf(float v, float lo, float hi) {
     return std::max(lo, std::min(hi, v));

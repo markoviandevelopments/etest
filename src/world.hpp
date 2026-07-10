@@ -17,9 +17,10 @@ struct Prop {
 };
 
 struct World {
-    static constexpr float CITY_HALF = 120.f;
-    static constexpr float BLOCK = 24.f;
-    static constexpr float ROAD = 8.f;
+    // ~560m across city + beach/ocean beyond south edge
+    static constexpr float CITY_HALF = 280.f;
+    static constexpr float BLOCK = 32.f;
+    static constexpr float ROAD = 10.f;
 
     Mesh cityMesh;
     Mesh waterMesh;

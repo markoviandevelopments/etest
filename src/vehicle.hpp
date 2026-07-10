@@ -55,9 +55,10 @@ struct Vehicle {
         speed = clampf(speed, -maxSpeed * 0.4f, maxSpeed);
 
         float turnScale = clampf(std::abs(speed) / 6.f, 0.f, 1.f);
-        // Invert steer when reversing so A/D stay intuitive
+        // Steer convention: positive = turn right (D). Flip when reversing.
+        // Yaw increases toward +X; facing +Z, right is -X → decrease yaw to turn right.
         float s = (speed < 0.f) ? -steer : steer;
-        yaw += s * turnRate * turnScale * dt;
+        yaw -= s * turnRate * turnScale * dt;
 
         // Unstick if already inside a building (bad spawn / desync)
         if (world.collides(pos.x, pos.z, 1.3f)) {
