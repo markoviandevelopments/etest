@@ -8,15 +8,17 @@ find_package(OpenGL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLFW REQUIRED glfw3)
 pkg_check_modules(GLEW REQUIRED glew)
+pkg_check_modules(FREETYPE REQUIRED freetype2)
 
 add_executable(gta6_clone src/main.cpp)
 target_include_directories(gta6_clone PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GLFW_INCLUDE_DIRS}
     ${GLEW_INCLUDE_DIRS}
+    ${FREETYPE_INCLUDE_DIRS}
 )
 target_link_libraries(gta6_clone PRIVATE
-    OpenGL::GL ${GLFW_LIBRARIES} ${GLEW_LIBRARIES} GL dl pthread
+    OpenGL::GL ${GLFW_LIBRARIES} ${GLEW_LIBRARIES} ${FREETYPE_LIBRARIES} GL dl pthread
 )
 target_compile_options(gta6_clone PRIVATE -Wall -Wextra -O2)
 

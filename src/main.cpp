@@ -1,8 +1,9 @@
 // Leonida Lights — multiplayer client (OpenGL 3.3 + GLFW + GLEW)
 //
-//   ./gta6_clone                         # connect 127.0.0.1:9043
-//   ./gta6_clone <host> [port]           # connect remote (Cloudflare TCP tunnel host)
-//   ./gta6_clone --offline               # single-player, no server
+//   ./gta6_clone              # Cloudflare Tunnel hostname via cloudflared access
+//                             # (never dials public :9043 — edge is 443)
+//   ./gta6_clone --local      # direct 127.0.0.1:9043 (same machine as server)
+//   ./gta6_clone --offline    # single-player
 //
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
@@ -10,12 +11,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <iostream>
 #include <algorithm>
 #include <unordered_map>
 #include <cstring>
+#include <chrono>
+#include <unistd.h>
 
 #include "math.hpp"
 #include "shader.hpp"
@@ -26,6 +31,8 @@
 #include "player.hpp"
 #include "protocol.hpp"
 #include "net.hpp"
+#include "text.hpp"
+#include "tunnel.hpp"
 
 static Camera gCam;
 static bool gKeys[512] = {};
@@ -72,22 +79,48 @@ uniform int uMode;
 out vec4 FragColor;
 void main() {
     vec3 n = normalize(vNrm);
-    float ndl = max(dot(n, normalize(-uLightDir)), 0.0);
-    float wrap = ndl * 0.7 + 0.3;
+    vec3 L = normalize(-uLightDir);
+    vec3 V = normalize(uCamPos - vWorld);
+    float ndl = max(dot(n, L), 0.0);
+    // Soft half-Lambert + stronger key light for clearer form
+    float wrap = ndl * 0.65 + 0.35;
+    float hemi = 0.5 + 0.5 * n.y; // sky vs ground ambient tint
     vec3 col = vCol;
+
     if (uMode == 1) {
-        float w = sin(vWorld.x * 0.15 + uTime * 1.2) * cos(vWorld.z * 0.12 + uTime * 0.9);
-        col = mix(col, vec3(0.2, 0.75, 0.9), 0.25 + 0.15 * w);
-        wrap = 0.7 + 0.3 * wrap;
+        float w = sin(vWorld.x * 0.18 + uTime * 1.3) * cos(vWorld.z * 0.14 + uTime * 1.0);
+        float w2 = sin(vWorld.x * 0.4 - uTime * 0.7 + vWorld.z * 0.35);
+        col = mix(col, vec3(0.15, 0.72, 0.88), 0.22 + 0.12 * w);
+        col += vec3(0.05, 0.1, 0.12) * w2 * 0.15;
+        wrap = 0.75 + 0.25 * wrap;
     }
-    float rim = pow(1.0 - max(dot(n, normalize(uCamPos - vWorld)), 0.0), 2.5);
-    vec3 rimCol = vec3(1.0, 0.45, 0.55) * rim * 0.18;
+
+    // Specular (Blinn-Phong) — pops cars, glass, wet roads
+    vec3 H = normalize(L + V);
+    float spec = pow(max(dot(n, H), 0.0), 48.0) * (0.15 + 0.55 * ndl);
+    if (uMode == 1) spec *= 1.8;
+
+    float rim = pow(1.0 - max(dot(n, V), 0.0), 2.8);
+    vec3 rimCol = vec3(1.0, 0.5, 0.58) * rim * 0.16;
+
+    // Fill light from opposite side (pink sunset bounce)
+    float fill = max(dot(n, normalize(vec3(-0.3, 0.2, -0.5))), 0.0) * 0.18;
+    vec3 fillCol = vec3(1.0, 0.45, 0.55) * fill;
+
+    vec3 ambient = uAmbient * (0.75 + 0.35 * hemi) + vec3(0.08, 0.1, 0.16) * (1.0 - hemi);
+    vec3 lit = col * (ambient + uLightColor * wrap) + uLightColor * spec + rimCol + fillCol;
+
+    // Mild distance haze (starts farther so the expanded city stays sharp)
     float dist = length(uCamPos - vWorld);
-    float fog = clamp((dist - 90.0) / 280.0, 0.0, 0.55);
-    vec3 fogCol = vec3(0.95, 0.68, 0.58);
-    vec3 lit = col * (uAmbient + uLightColor * wrap) + rimCol;
+    float fog = clamp((dist - 160.0) / 420.0, 0.0, 0.5);
+    vec3 fogCol = vec3(0.78, 0.72, 0.82);
     lit = mix(lit, fogCol, fog);
-    FragColor = vec4(lit, uMode == 1 ? 0.92 : 1.0);
+
+    // Simple tonemap / gamma for punchier contrast
+    lit = lit / (lit + vec3(0.85));
+    lit = pow(lit, vec3(1.0 / 1.05));
+
+    FragColor = vec4(lit, uMode == 1 ? 0.9 : 1.0);
 }
 )";
 
@@ -255,7 +288,7 @@ struct NetClient {
             ::close(fd); fd = -1; connected = false;
             return false;
         }
-        lastRecv = glfwGetTime();
+        lastRecv = 0;
         return true;
     }
 
@@ -313,31 +346,148 @@ static void applyVehicleSnap(Vehicle& car, const llmp::VehicleSnap& s, bool forc
 
 int main(int argc, char** argv) {
     NetClient net;
-    net.host = "127.0.0.1";
-    net.port = llmp::DEFAULT_PORT;
+    net.host = llmp::DEFAULT_HOST; // Cloudflare public hostname (no public game port)
+    net.port = llmp::DEFAULT_PORT; // only used for --local / direct IPs
+    bool nameFromArgs = false;
+    bool forceLocal = false;
 
-    // Args: --offline | --name X | host [port]
+    // Args: --offline | --local | --name X | host [port]
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--offline" || a == "-o") {
             net.offline = true;
+        } else if (a == "--local" || a == "-l") {
+            net.host = "127.0.0.1";
+            net.port = llmp::DEFAULT_PORT;
+            forceLocal = true;
         } else if ((a == "--name" || a == "-n") && i + 1 < argc) {
             net.playerName = argv[++i];
+            nameFromArgs = true;
         } else if (a == "--help" || a == "-h") {
-            std::cout << "Usage: " << argv[0] << " [--offline] [--name Name] [host] [port]\n"
-                      << "  Default: connect to 127.0.0.1:" << llmp::DEFAULT_PORT << "\n"
-                      << "  Server:  ./gta6_server   (0.0.0.0:" << llmp::DEFAULT_PORT << ")\n";
+            std::cout
+                << "Usage: " << argv[0] << " [--offline] [--local] [--name Name] [host]\n"
+                << "\n"
+                << "  Default online:\n"
+                << "    hostname  " << llmp::DEFAULT_HOST << "\n"
+                << "    method    cloudflared access tcp  (uses Cloudflare 443, NOT public :9043)\n"
+                << "    then      game → 127.0.0.1:<local proxy port>\n"
+                << "\n"
+                << "  --local     direct TCP 127.0.0.1:" << llmp::DEFAULT_PORT
+                << "  (same PC as ./gta6_server)\n"
+                << "  --offline   single-player\n"
+                << "\n"
+                << "  Server origin stays:  tcp://localhost:9043  (on the host machine)\n"
+                << "  Do NOT open/connect public :9043 on the Cloudflare hostname.\n";
             return 0;
         } else if (a[0] != '-') {
-            net.host = a;
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                net.port = std::atoi(argv[++i]);
-                if (net.port <= 0) net.port = llmp::DEFAULT_PORT;
+            // Hostname only for tunnel hosts; strip accidental :9043
+            std::string h = a;
+            int p = net.port;
+            bool tun = needsCloudflaredAccess(h) ||
+                       h.find("immenseaccumulationonline.online") != std::string::npos;
+            // if they passed host:port, parse
+            if (i + 1 < argc && argv[i + 1][0] != '-' &&
+                argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
+                // separate port argument
+                h = a;
+                p = std::atoi(argv[++i]);
+            } else {
+                parseHostPort(a, h, p, llmp::DEFAULT_PORT, tun || needsCloudflaredAccess(a));
             }
+            net.host = h;
+            // For tunnel hostnames, ignore public port (Access uses local proxy port later)
+            if (!needsCloudflaredAccess(net.host))
+                net.port = (p > 0) ? p : llmp::DEFAULT_PORT;
+            else
+                net.port = llmp::DEFAULT_PORT; // unused until rewritten to 127.0.0.1:proxy
         }
     }
-    if (const char* envName = std::getenv("LEONIDA_NAME"))
+    if (const char* envName = std::getenv("LEONIDA_NAME")) {
         net.playerName = envName;
+        nameFromArgs = true;
+    }
+    // Random Vice-style username unless user provided one
+    if (!nameFromArgs || net.playerName.empty() || net.playerName == "Player") {
+        unsigned seed = static_cast<unsigned>(std::time(nullptr)) ^
+                        static_cast<unsigned>(reinterpret_cast<uintptr_t>(&net) & 0xffffffffu);
+        net.playerName = randomUsername(seed);
+    }
+
+    std::cout << "Leonida Lights client\n"
+              << "  user: " << net.playerName << "\n" << std::flush;
+
+    // ---- Network FIRST (before GL window) so we never freeze on a black screen ----
+    TunnelProxy tunnelProxy;
+    if (!net.offline && !forceLocal && needsCloudflaredAccess(net.host)) {
+        // Never dial hostname:9043. Origin port 9043 exists only on the server LAN.
+        if (!tunnelProxy.start(net.host)) {
+            std::cerr << "WARN: Cloudflare Access proxy failed — try --local or --offline\n";
+            net.offline = true;
+            net.status = "offline (tunnel proxy failed)";
+        } else {
+            net.host = "127.0.0.1";
+            net.port = tunnelProxy.localPort;
+        }
+    }
+
+    if (!net.offline) {
+        std::cout << "Connecting to " << net.host << ":" << net.port
+                  << (tunnelProxy.running() ? "  (via Access proxy)" : "  (direct TCP)")
+                  << " ...\n" << std::flush;
+        if (!net.connect()) {
+            std::cerr << "WARN: " << net.status << " — falling back to offline\n";
+            net.offline = true;
+            net.status = "offline (connect failed)";
+        }
+    } else {
+        net.status = "offline";
+    }
+
+    // Complete HELLO/WELCOME handshake before opening the window (longer timeout over tunnel)
+    std::vector<uint8_t> welcomePayload;
+    if (net.connected) {
+        std::cout << "Waiting for server WELCOME...\n" << std::flush;
+        auto t0 = std::chrono::steady_clock::now();
+        const double limit = tunnelProxy.running() ? 15.0 : 5.0;
+        while (!net.welcomed) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            if (elapsed > limit) {
+                std::cerr << "No WELCOME within " << limit << "s — offline\n";
+                net.disconnect();
+                net.offline = true;
+                net.status = "offline (no welcome)";
+                break;
+            }
+            if (!llmp::recvInto(net.fd, net.in)) {
+                std::cerr << "Disconnected before WELCOME — offline\n";
+                net.disconnect();
+                net.offline = true;
+                net.status = "offline (disconnect)";
+                break;
+            }
+            uint16_t type = 0;
+            std::vector<uint8_t> payload;
+            while (net.in.pop(type, payload)) {
+                if (type == llmp::S_WELCOME && payload.size() >= sizeof(llmp::ServerWelcome)) {
+                    llmp::ServerWelcome w{};
+                    std::memcpy(&w, payload.data(), sizeof(w));
+                    net.localId = w.player_id;
+                    net.welcomed = true;
+                    net.status = "online id=" + std::to_string(net.localId);
+                    welcomePayload = std::move(payload);
+                } else if (type == llmp::S_REJECT) {
+                    std::cerr << "Rejected by server\n";
+                    net.disconnect();
+                    net.offline = true;
+                    net.status = "rejected";
+                }
+            }
+            if (!net.welcomed) usleep(10000);
+        }
+        if (net.welcomed)
+            std::cout << "Joined as id=" << net.localId << " (" << net.playerName << ")\n" << std::flush;
+    }
 
     if (!glfwInit()) {
         std::cerr << "Failed to init GLFW\n";
@@ -346,8 +496,10 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_SAMPLES, 8);
+    glfwWindowHint(GLFW_SAMPLES, 16);
     glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+    glfwWindowHint(GLFW_DEPTH_BITS, 24);
+    glfwWindowHint(GLFW_STENCIL_BITS, 8);
 
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
     int monW = 1920, monH = 1080;
@@ -355,8 +507,9 @@ int main(int argc, char** argv) {
         const GLFWvidmode* mode = glfwGetVideoMode(monitor);
         if (mode) { monW = mode->width; monH = mode->height; }
     }
-    gWinW = std::max(1280, monW - 80);
-    gWinH = std::max(720, monH - 100);
+    // Prefer near-native resolution for sharper image
+    gWinW = std::max(1600, monW - 40);
+    gWinH = std::max(900, monH - 60);
 
     std::string winTitle = "Leonida Lights";
     GLFWwindow* window = glfwCreateWindow(gWinW, gWinH, winTitle.c_str(), nullptr, nullptr);
@@ -388,14 +541,20 @@ int main(int argc, char** argv) {
     }
 
     glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(0.55f, 0.62f, 0.85f, 1.f);
+    glClearColor(0.45f, 0.58f, 0.88f, 1.f); // clearer sky blue
 
     Shader worldSh; worldSh.id = makeProgram(VERT_SRC, FRAG_SRC);
     Shader hudSh; hudSh.id = makeProgram(HUD_VERT, HUD_FRAG);
     HudMesh hud;
+
+    TextRenderer text;
+    if (!text.init(32.f)) {
+        std::cerr << "Warning: text renderer failed — menus will lack labels\n";
+    }
 
     World world;
     world.generate(2026);
@@ -434,97 +593,51 @@ int main(int argc, char** argv) {
             {0.8f,0.2f,0.2f},{0.2f,0.4f,0.8f},{0.2f,0.7f,0.3f},
             {0.9f,0.6f,0.1f},{0.6f,0.6f,0.65f},{0.1f,0.1f,0.12f}
         };
-        for (int i = 0; i < 20; ++i) {
-            int ri = (i % 5) - 2;
-            float z = ((i / 5) - 2) * World::BLOCK; // on grid roads
+        for (int i = 0; i < 36; ++i) {
+            int ri = (i % 7) - 3;
+            float z = ((i / 7) - 2) * World::BLOCK;
             int ci = i % 6;
             float yaw = (i % 2) ? 0.f : 3.14159f;
-            // Offset slightly within the road lane, not into lots
             addCar(ri * World::BLOCK + 1.2f, z, yaw,
                    carColors[ci][0], carColors[ci][1], carColors[ci][2], true);
         }
     };
     spawnDefaultCars();
 
-    // Connect multiplayer
-    if (!net.offline) {
-        std::cout << "Connecting to " << net.host << ":" << net.port << " ...\n";
-        if (!net.connect()) {
-            std::cerr << "WARN: " << net.status << " — falling back to offline\n";
-            net.offline = true;
-            net.status = "offline (connect failed)";
-        }
-    } else {
-        net.status = "offline";
-    }
-
-    // Wait briefly for WELCOME if online
-    if (net.connected) {
-        double tWait = glfwGetTime();
-        while (!net.welcomed && glfwGetTime() - tWait < 3.0) {
-            if (!llmp::recvInto(net.fd, net.in)) break;
-            uint16_t type; std::vector<uint8_t> payload;
-            while (net.in.pop(type, payload)) {
-                if (type == llmp::S_WELCOME && payload.size() >= sizeof(llmp::ServerWelcome)) {
-                    llmp::ServerWelcome w{};
-                    std::memcpy(&w, payload.data(), sizeof(w));
-                    net.localId = w.player_id;
-                    net.welcomed = true;
-                    net.status = "online id=" + std::to_string(net.localId);
-
-                    size_t off = sizeof(llmp::ServerWelcome);
-                    // Rebuild cars from server
-                    for (auto& c : cars) c.destroy();
-                    cars.clear();
-                    for (uint16_t i = 0; i < w.vehicle_count; ++i) {
-                        if (off + sizeof(llmp::VehicleSnap) > payload.size()) break;
-                        llmp::VehicleSnap s{};
-                        std::memcpy(&s, payload.data() + off, sizeof(s));
-                        off += sizeof(s);
-                        Vehicle v;
-                        v.init(Vec3(s.x, s.y, s.z), s.yaw, s.r, s.g, s.b, s.owner < 0);
-                        v.speed = s.speed;
-                        v.occupied = s.owner >= 0;
-                        // Ensure vector index matches server vehicle id
-                        while ((int)cars.size() < s.id) {
-                            Vehicle pad;
-                            pad.init(Vec3(0, -100, 0), 0, 0.2f, 0.2f, 0.2f, false);
-                            cars.push_back(std::move(pad));
-                        }
-                        if ((int)cars.size() == s.id)
-                            cars.push_back(std::move(v));
-                        else if (s.id >= 0 && s.id < (int)cars.size()) {
-                            cars[s.id].destroy();
-                            cars[s.id] = std::move(v);
-                        }
-                    }
-                    // Spawn on road, spread by player id, never inside a building
-                    float sx = ((int)(net.localId % 5) - 2) * 3.f;
-                    float sz = ((int)(net.localId / 5) % 5) * 3.f;
-                    player.pos = world.findClearSpawn(sx, sz, 0.5f);
-                    player.ensureFree(world);
-                    std::cout << "Joined as player " << net.localId
-                              << " (" << net.playerName << ") vehicles=" << cars.size()
-                              << " spawn (" << player.pos.x << ", " << player.pos.z << ")\n";
-                } else if (type == llmp::S_REJECT) {
-                    std::string reason(payload.begin(), payload.end());
-                    std::cerr << "Rejected: " << reason << "\n";
-                    net.disconnect();
-                    net.offline = true;
-                    net.status = "rejected";
-                    spawnDefaultCars();
-                }
+    // Apply WELCOME vehicle list now that GL context exists (meshes need GL)
+    if (net.welcomed && welcomePayload.size() >= sizeof(llmp::ServerWelcome)) {
+        llmp::ServerWelcome w{};
+        std::memcpy(&w, welcomePayload.data(), sizeof(w));
+        size_t off = sizeof(llmp::ServerWelcome);
+        for (auto& c : cars) c.destroy();
+        cars.clear();
+        for (uint16_t i = 0; i < w.vehicle_count; ++i) {
+            if (off + sizeof(llmp::VehicleSnap) > welcomePayload.size()) break;
+            llmp::VehicleSnap s{};
+            std::memcpy(&s, welcomePayload.data() + off, sizeof(s));
+            off += sizeof(s);
+            Vehicle v;
+            v.init(Vec3(s.x, s.y, s.z), s.yaw, s.r, s.g, s.b, s.owner < 0);
+            v.speed = s.speed;
+            v.occupied = s.owner >= 0;
+            while ((int)cars.size() < s.id) {
+                Vehicle pad;
+                pad.init(Vec3(0, -100, 0), 0, 0.2f, 0.2f, 0.2f, false);
+                cars.push_back(std::move(pad));
             }
-            // tiny sleep via glfw
-            glfwPollEvents();
+            if ((int)cars.size() == s.id)
+                cars.push_back(std::move(v));
+            else if (s.id >= 0 && s.id < (int)cars.size()) {
+                cars[s.id].destroy();
+                cars[s.id] = std::move(v);
+            }
         }
-        if (!net.welcomed && net.connected) {
-            std::cerr << "No WELCOME from server — offline mode\n";
-            net.disconnect();
-            net.offline = true;
-            net.status = "offline (no welcome)";
-            spawnDefaultCars();
-        }
+        float sx = ((int)(net.localId % 5) - 2) * 3.f;
+        float sz = ((int)(net.localId / 5) % 5) * 3.f;
+        player.pos = world.findClearSpawn(sx, sz, 0.5f);
+        player.ensureFree(world);
+        std::cout << "World ready — vehicles=" << cars.size()
+                  << " spawn (" << player.pos.x << ", " << player.pos.z << ")\n";
     }
 
     Mesh pedMeshes[4];
@@ -558,8 +671,9 @@ int main(int argc, char** argv) {
 
     std::cout << "\n=== Leonida Lights Multiplayer ===\n"
               << "Mode: " << net.status << "\n"
+              << "Username: " << net.playerName << "\n"
               << "WASD move | Shift run | Mouse look | E enter/exit | Esc menu\n"
-              << "R unstuck (teleport to nearest road) | Online players = colored peds\n\n";
+              << "R unstuck | H help | Esc pause (shows player count)\n\n";
 
     while (!glfwWindowShouldClose(window)) {
         double now = glfwGetTime();
@@ -611,6 +725,11 @@ int main(int argc, char** argv) {
                             rp.inVehicle = ps.in_vehicle != 0;
                             rp.vehicleId = ps.vehicle_id;
                             std::memcpy(rp.name, ps.name, llmp::MAX_NAME);
+                            rp.name[llmp::MAX_NAME - 1] = 0;
+                            if (rp.name[0] == 0 || std::strcmp(rp.name, "Player") == 0) {
+                                std::string gen = randomUsername(ps.id * 9973u + 42u);
+                                std::snprintf(rp.name, llmp::MAX_NAME, "%s", gen.c_str());
+                            }
                             rp.cr = ps.cr; rp.cg = ps.cg; rp.cb = ps.cb;
                             rp.ensureMesh();
                         }
@@ -797,12 +916,12 @@ int main(int argc, char** argv) {
         }
 
         float aspect = gWinH > 0 ? static_cast<float>(gWinW) / gWinH : 1.777f;
-        Mat4 proj = Mat4::perspective(deg2rad(65.f), aspect, 0.12f, 500.f);
+        Mat4 proj = Mat4::perspective(deg2rad(62.f), aspect, 0.1f, 900.f);
         Mat4 view = gCam.view();
 
-        Vec3 lightDir = Vec3(0.35f, -0.75f, 0.4f).normalized();
-        Vec3 lightColor(1.0f, 0.88f, 0.75f);
-        Vec3 ambient(0.38f, 0.36f, 0.42f);
+        Vec3 lightDir = Vec3(0.42f, -0.78f, 0.35f).normalized();
+        Vec3 lightColor(1.05f, 0.95f, 0.85f);
+        Vec3 ambient(0.32f, 0.34f, 0.42f);
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -856,10 +975,14 @@ int main(int argc, char** argv) {
             marker.draw();
         }
 
-        // HUD
+        // HUD panels (solid quads) + FreeType text on top
         glDisable(GL_DEPTH_TEST);
         std::vector<float> hd;
 
+        bool online = net.connected && net.welcomed;
+        int playerCount = online ? static_cast<int>(remotes.size()) + 1 : 1;
+
+        // Minimap frame
         pushQuad(hd, 0.62f, -0.95f, 0.95f, -0.55f, 0.05f, 0.08f, 0.12f);
         pushQuad(hd, 0.62f, -0.95f, 0.95f, -0.93f, 0.95f, 0.4f, 0.6f);
         pushQuad(hd, 0.62f, -0.57f, 0.95f, -0.55f, 0.95f, 0.4f, 0.6f);
@@ -872,7 +995,6 @@ int main(int argc, char** argv) {
             float py = clampf(-0.75f - mz * 0.16f, -0.93f, -0.58f);
             pushQuad(hd, px - 0.012f, py - 0.012f, px + 0.012f, py + 0.012f, 0.2f, 1.f, 0.4f);
         }
-        // remote blips
         for (auto& kv : remotes) {
             float mx = kv.second.pos.x / World::CITY_HALF;
             float mz = kv.second.pos.z / World::CITY_HALF;
@@ -897,18 +1019,19 @@ int main(int argc, char** argv) {
             pushQuad(hd, -0.95f, -0.92f, -0.95f + 0.4f * sp, -0.85f, 0.2f, 0.85f, 1.f);
         }
 
+        // Wanted stars
         for (int i = 0; i < 5; ++i) {
             float x0 = 0.55f + i * 0.07f;
             float lit = (i < stars) ? 1.f : 0.25f;
             pushQuad(hd, x0, 0.88f, x0 + 0.05f, 0.95f, lit, lit * 0.85f, 0.1f);
         }
 
-        // MP status bar
-        bool online = net.connected && net.welcomed;
-        pushQuad(hd, -0.95f, 0.88f, -0.45f, 0.96f,
-                 online ? 0.05f : 0.15f, online ? 0.2f : 0.08f, online ? 0.1f : 0.08f);
-        pushQuad(hd, -0.93f, 0.90f, -0.47f, 0.94f,
-                 online ? 0.3f : 0.6f, online ? 0.9f : 0.4f, online ? 0.5f : 0.3f);
+        // Top-left status panel background
+        pushQuad(hd, -0.98f, 0.72f, -0.38f, 0.97f, 0.04f, 0.05f, 0.08f);
+
+        // Health bar
+        pushQuad(hd, -0.95f, -0.82f, -0.55f, -0.76f, 0.15f, 0.05f, 0.05f);
+        pushQuad(hd, -0.95f, -0.82f, -0.58f, -0.76f, 0.2f, 0.85f, 0.35f);
 
         int nearCar = -1;
         if (!player.inVehicle) {
@@ -922,26 +1045,20 @@ int main(int argc, char** argv) {
             }
         }
         if (nearCar >= 0) {
-            pushQuad(hd, -0.28f, -0.55f, 0.28f, -0.42f, 0.05f, 0.12f, 0.08f);
-            pushQuad(hd, -0.26f, -0.52f, 0.26f, -0.45f, 0.35f, 0.95f, 0.5f);
+            pushQuad(hd, -0.32f, -0.58f, 0.32f, -0.42f, 0.05f, 0.12f, 0.08f);
         }
 
         if (gShowHelp && !gPaused) {
-            pushQuad(hd, -0.98f, 0.35f, -0.42f, 0.85f, 0.02f, 0.04f, 0.08f);
-            for (int i = 0; i < 7; ++i) {
-                float y = 0.78f - i * 0.06f;
-                float w = 0.42f - (i % 3) * 0.06f;
-                pushQuad(hd, -0.95f, y, -0.95f + w, y + 0.022f, 0.75f, 0.8f, 0.9f);
-            }
+            pushQuad(hd, -0.98f, 0.08f, -0.36f, 0.70f, 0.03f, 0.04f, 0.07f);
         }
 
-        pushQuad(hd, -0.95f, -0.82f, -0.55f, -0.76f, 0.15f, 0.05f, 0.05f);
-        pushQuad(hd, -0.95f, -0.82f, -0.58f, -0.76f, 0.2f, 0.85f, 0.35f);
+        // Mission banner bg
+        pushQuad(hd, -0.28f, 0.88f, 0.28f, 0.97f, 0.12f, 0.05f, 0.16f);
 
         if (gPaused) {
             pushQuad(hd, -1.f, -1.f, 1.f, 1.f, 0.02f, 0.03f, 0.06f);
-            pushQuad(hd, -0.38f, -0.42f, 0.38f, 0.42f, 0.08f, 0.1f, 0.16f);
-            pushQuad(hd, -0.36f, 0.28f, 0.36f, 0.38f, 0.95f, 0.4f, 0.65f);
+            pushQuad(hd, -0.42f, -0.48f, 0.42f, 0.48f, 0.08f, 0.1f, 0.16f);
+            pushQuad(hd, -0.40f, 0.30f, 0.40f, 0.44f, 0.85f, 0.3f, 0.55f);
             float nx, ny;
             cursorToNdc(window, nx, ny);
             bool hoverResume = pointInRect(nx, ny, btnResume[0], btnResume[1], btnResume[2], btnResume[3]);
@@ -950,33 +1067,129 @@ int main(int argc, char** argv) {
                      hoverResume ? 0.25f : 0.15f, hoverResume ? 0.75f : 0.45f, hoverResume ? 0.4f : 0.3f);
             pushQuad(hd, btnQuit[0], btnQuit[1], btnQuit[2], btnQuit[3],
                      hoverQuit ? 0.85f : 0.5f, hoverQuit ? 0.25f : 0.15f, hoverQuit ? 0.3f : 0.2f);
-            pushQuad(hd, -0.14f, 0.12f, 0.14f, 0.18f, 0.95f, 0.95f, 0.98f);
-            pushQuad(hd, -0.10f, -0.14f, 0.10f, -0.08f, 0.95f, 0.9f, 0.9f);
-            pushQuad(hd, -0.28f, -0.32f, 0.28f, -0.28f, 0.5f, 0.55f, 0.65f);
-            pushQuad(hd, -0.22f, -0.38f, 0.22f, -0.34f, 0.4f, 0.45f, 0.55f);
         }
 
         hud.upload(hd);
         hudSh.use();
-        glUniform1f(glGetUniformLocation(hudSh.id, "uAlpha"), gPaused ? 0.92f : 0.88f);
+        glUniform1f(glGetUniformLocation(hudSh.id, "uAlpha"), gPaused ? 0.88f : 0.82f);
         hud.draw();
-        glEnable(GL_DEPTH_TEST);
 
-        char title[384];
+        // ---- Real text (FreeType) ----
         float spd = 0.f;
         if (player.inVehicle && player.vehicleIndex >= 0 &&
             player.vehicleIndex < (int)cars.size())
             spd = std::abs(cars[player.vehicleIndex].speed) * 3.6f;
 
+        char line[160];
+        // Status panel
+        std::snprintf(line, sizeof(line), "Players online: %d", playerCount);
+        text.drawShadowed(line, -0.96f, 0.90f, 0.72f, 0.35f, 1.f, 0.55f, 1.f, gWinW, gWinH);
+        std::snprintf(line, sizeof(line), "You: %s", net.playerName.c_str());
+        text.drawShadowed(line, -0.96f, 0.84f, 0.58f, 1.f, 0.9f, 0.95f, 1.f, gWinW, gWinH);
+        if (online)
+            std::snprintf(line, sizeof(line), "Online  id %u  %s", net.localId, net.status.c_str());
+        else
+            std::snprintf(line, sizeof(line), "Offline  %s", net.status.c_str());
+        text.drawShadowed(line, -0.96f, 0.78f, 0.5f, 0.75f, 0.85f, 1.f, 1.f, gWinW, gWinH);
+
+        // Mission
+        if (!missionDone)
+            text.drawCenteredShadowed("MISSION: South Beach", 0.f, 0.905f, 0.55f,
+                                      1.f, 0.55f, 0.85f, 1.f, gWinW, gWinH);
+        else
+            text.drawCenteredShadowed("MISSION COMPLETE", 0.f, 0.905f, 0.55f,
+                                      0.4f, 1.f, 0.55f, 1.f, gWinW, gWinH);
+
+        // Wanted label
+        text.drawShadowed("WANTED", 0.42f, 0.905f, 0.45f, 1.f, 0.85f, 0.2f, 1.f, gWinW, gWinH);
+
+        // Speed / health labels
+        text.drawShadowed("HEALTH", -0.95f, -0.72f, 0.42f, 0.9f, 0.9f, 0.9f, 1.f, gWinW, gWinH);
+        if (player.inVehicle) {
+            std::snprintf(line, sizeof(line), "SPEED  %.0f km/h", spd);
+            text.drawShadowed(line, -0.95f, -0.88f, 0.45f, 0.4f, 0.95f, 1.f, 1.f, gWinW, gWinH);
+        }
+
+        // Minimap label
+        text.drawCenteredShadowed("MAP", 0.785f, -0.52f, 0.4f, 0.95f, 0.7f, 0.85f, 1.f, gWinW, gWinH);
+
+        if (nearCar >= 0) {
+            text.drawCenteredShadowed("[E] Enter vehicle", 0.f, -0.48f, 0.65f,
+                                      0.45f, 1.f, 0.55f, 1.f, gWinW, gWinH);
+        }
+
+        if (gShowHelp && !gPaused) {
+            const char* helpLines[] = {
+                "CONTROLS",
+                "WASD  Move / Drive",
+                "Shift  Run",
+                "Mouse  Look  |  Scroll Zoom",
+                "E  Enter / Exit car",
+                "R  Unstuck",
+                "Space  Handbrake",
+                "Esc  Pause menu",
+                "H  Toggle this help",
+            };
+            float y = 0.64f;
+            for (const char* hl : helpLines) {
+                text.drawShadowed(hl, -0.96f, y, 0.48f, 0.9f, 0.92f, 1.f, 1.f, gWinW, gWinH);
+                y -= 0.055f;
+            }
+        }
+
+        // Floating nameplates for every real player (local + remotes)
+        auto drawNameplate = [&](const std::string& name, const Vec3& worldPos,
+                                 float cr, float cg, float cb) {
+            float nx, ny;
+            Vec3 head = worldPos + Vec3(0, 2.15f, 0);
+            if (!worldToNdc(view, proj, head, nx, ny)) return;
+            if (nx < -1.15f || nx > 1.15f || ny < -1.15f || ny > 1.15f) return;
+            // slight distance scale
+            float dist = Vec3::distance(gCam.position, worldPos);
+            float sc = clampf(0.85f - dist * 0.004f, 0.4f, 0.85f);
+            text.drawCenteredShadowed(name, nx, ny, sc, cr, cg, cb, 1.f, gWinW, gWinH);
+        };
+
+        // Local player
+        {
+            Vec3 lp = player.inVehicle ? player.focusPoint(cars) : player.pos;
+            drawNameplate(net.playerName, lp, 0.45f, 1.f, 0.55f);
+        }
+        // Remote players (above ped or vehicle)
+        for (auto& kv : remotes) {
+            RemotePlayer& rp = kv.second;
+            Vec3 wp = rp.pos;
+            if (rp.inVehicle && rp.vehicleId >= 0 && rp.vehicleId < (int)cars.size())
+                wp = cars[rp.vehicleId].pos;
+            std::string nm = rp.name[0] ? rp.name : randomUsername(rp.id);
+            drawNameplate(nm, wp, rp.cr, rp.cg, rp.cb);
+        }
+
+        if (gPaused) {
+            text.drawCenteredShadowed("PAUSED", 0.f, 0.34f, 0.95f, 1.f, 1.f, 1.f, 1.f, gWinW, gWinH);
+            text.drawCenteredShadowed("RESUME", 0.f, 0.12f, 0.7f, 1.f, 1.f, 1.f, 1.f, gWinW, gWinH);
+            text.drawCenteredShadowed("QUIT", 0.f, -0.14f, 0.7f, 1.f, 0.9f, 0.9f, 1.f, gWinW, gWinH);
+            std::snprintf(line, sizeof(line), "Players online: %d", playerCount);
+            text.drawCenteredShadowed(line, 0.f, -0.28f, 0.5f, 0.5f, 1.f, 0.65f, 1.f, gWinW, gWinH);
+            std::snprintf(line, sizeof(line), "Playing as %s", net.playerName.c_str());
+            text.drawCenteredShadowed(line, 0.f, -0.35f, 0.45f, 0.9f, 0.85f, 1.f, 1.f, gWinW, gWinH);
+            text.drawCenteredShadowed("Mouse free — move/resize window", 0.f, -0.42f, 0.4f,
+                                      0.7f, 0.75f, 0.85f, 1.f, gWinW, gWinH);
+            text.drawCenteredShadowed("Esc / Enter resume", 0.f, -0.47f, 0.38f,
+                                      0.6f, 0.65f, 0.75f, 1.f, gWinW, gWinH);
+        }
+
+        glEnable(GL_DEPTH_TEST);
+
+        char title[384];
         if (gPaused) {
             std::snprintf(title, sizeof(title),
-                "PAUSED — mouse free | Esc/Enter resume | Quit button to exit | %s",
-                net.status.c_str());
+                "PAUSED | Players: %d | %s | Esc resume",
+                playerCount, net.playerName.c_str());
         } else {
             std::snprintf(title, sizeof(title),
-                "Leonida | %s | players:%zu | (%.0f,%.0f) | %s | %.0f km/h%s",
-                net.status.c_str(),
-                remotes.size() + (online ? 1 : 0),
+                "Leonida | Players: %d | %s | (%.0f,%.0f) | %s | %.0f km/h%s",
+                playerCount, net.playerName.c_str(),
                 focus.x, focus.z,
                 player.inVehicle ? "DRIVING" : "ON FOOT",
                 spd,
@@ -986,6 +1199,7 @@ int main(int argc, char** argv) {
         glfwSwapBuffers(window);
     }
 
+    text.destroy();
     net.disconnect();
     player.destroy();
     for (auto& c : cars) c.destroy();

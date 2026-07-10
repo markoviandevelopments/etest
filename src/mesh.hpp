@@ -115,22 +115,35 @@ inline Mesh makeGroundPlane(float size, float r, float g, float b, int subdiv = 
     Mesh m; m.upload(verts, idx); return m;
 }
 
-// Simple car body (body + cabin + wheels as boxes baked together)
+// Car body with more silhouette detail (hood / cabin / bumper / wheels)
 inline Mesh makeCarMesh(float r, float g, float b) {
     std::vector<Vertex> verts;
     std::vector<unsigned> idx;
-    // body
-    pushBox(verts, idx, -1.1f, 0.15f, -2.2f, 1.1f, 0.85f, 2.0f, r, g, b, 0.06f);
+    // lower body
+    pushBox(verts, idx, -1.15f, 0.18f, -2.25f, 1.15f, 0.72f, 2.05f, r, g, b, 0.07f);
+    // hood (front)
+    pushBox(verts, idx, -1.05f, 0.72f, 0.55f, 1.05f, 0.92f, 1.95f, r * 0.95f, g * 0.95f, b * 0.95f, 0.05f);
+    // trunk (rear)
+    pushBox(verts, idx, -1.05f, 0.72f, -2.1f, 1.05f, 0.95f, -0.55f, r * 0.92f, g * 0.92f, b * 0.92f, 0.05f);
     // cabin
-    pushBox(verts, idx, -0.9f, 0.85f, -0.6f, 0.9f, 1.45f, 1.2f, r * 0.85f, g * 0.85f, b * 0.9f, 0.05f);
-    // windshield tint (darker top of cabin front)
-    pushBox(verts, idx, -0.85f, 0.95f, 0.9f, 0.85f, 1.4f, 1.15f, 0.35f, 0.5f, 0.65f, 0.0f);
+    pushBox(verts, idx, -0.95f, 0.9f, -0.55f, 0.95f, 1.52f, 1.05f, r * 0.82f, g * 0.82f, b * 0.88f, 0.05f);
+    // glass
+    pushBox(verts, idx, -0.88f, 0.98f, 0.85f, 0.88f, 1.48f, 1.08f, 0.35f, 0.55f, 0.7f, 0.0f);
+    pushBox(verts, idx, -0.88f, 0.98f, -0.58f, 0.88f, 1.48f, -0.42f, 0.3f, 0.45f, 0.6f, 0.0f);
+    // bumpers
+    pushBox(verts, idx, -1.2f, 0.22f, 1.95f, 1.2f, 0.55f, 2.25f, 0.25f, 0.25f, 0.28f, 0.02f);
+    pushBox(verts, idx, -1.2f, 0.22f, -2.4f, 1.2f, 0.55f, -2.15f, 0.25f, 0.25f, 0.28f, 0.02f);
+    // headlights / taillights
+    pushBox(verts, idx, -1.05f, 0.45f, 2.05f, -0.55f, 0.65f, 2.22f, 0.95f, 0.95f, 0.75f, 0.f);
+    pushBox(verts, idx,  0.55f, 0.45f, 2.05f,  1.05f, 0.65f, 2.22f, 0.95f, 0.95f, 0.75f, 0.f);
+    pushBox(verts, idx, -1.05f, 0.45f, -2.38f, -0.55f, 0.65f, -2.2f, 0.9f, 0.15f, 0.12f, 0.f);
+    pushBox(verts, idx,  0.55f, 0.45f, -2.38f,  1.05f, 0.65f, -2.2f, 0.9f, 0.15f, 0.12f, 0.f);
     // wheels
-    float wr = 0.12f, wg = 0.12f, wb = 0.14f;
-    pushBox(verts, idx, -1.25f, 0.0f, 1.2f, -0.95f, 0.45f, 1.7f, wr, wg, wb);
-    pushBox(verts, idx,  0.95f, 0.0f, 1.2f,  1.25f, 0.45f, 1.7f, wr, wg, wb);
-    pushBox(verts, idx, -1.25f, 0.0f,-1.7f, -0.95f, 0.45f,-1.2f, wr, wg, wb);
-    pushBox(verts, idx,  0.95f, 0.0f,-1.7f,  1.25f, 0.45f,-1.2f, wr, wg, wb);
+    float wr = 0.1f, wg = 0.1f, wb = 0.12f;
+    pushBox(verts, idx, -1.28f, 0.0f, 1.15f, -0.92f, 0.48f, 1.75f, wr, wg, wb);
+    pushBox(verts, idx,  0.92f, 0.0f, 1.15f,  1.28f, 0.48f, 1.75f, wr, wg, wb);
+    pushBox(verts, idx, -1.28f, 0.0f,-1.75f, -0.92f, 0.48f,-1.15f, wr, wg, wb);
+    pushBox(verts, idx,  0.92f, 0.0f,-1.75f,  1.28f, 0.48f,-1.15f, wr, wg, wb);
     Mesh m; m.upload(verts, idx); return m;
 }
 
@@ -153,12 +166,17 @@ inline Mesh makePlayerMesh() {
 inline Mesh makePalmMesh() {
     std::vector<Vertex> verts;
     std::vector<unsigned> idx;
-    // trunk
-    pushBox(verts, idx, -0.18f, 0, -0.18f, 0.18f, 4.5f, 0.18f, 0.45f, 0.3f, 0.15f);
-    // fronds (cross)
-    pushBox(verts, idx, -2.2f, 4.2f, -0.15f, 2.2f, 4.6f, 0.15f, 0.15f, 0.55f, 0.2f);
-    pushBox(verts, idx, -0.15f, 4.2f, -2.2f, 0.15f, 4.6f, 2.2f, 0.12f, 0.5f, 0.18f);
-    pushBox(verts, idx, -1.5f, 4.5f, -1.5f, 1.5f, 4.85f, 1.5f, 0.2f, 0.6f, 0.22f);
+    // segmented trunk
+    pushBox(verts, idx, -0.2f, 0, -0.2f, 0.2f, 1.6f, 0.2f, 0.48f, 0.32f, 0.16f);
+    pushBox(verts, idx, -0.17f, 1.5f, -0.17f, 0.17f, 3.2f, 0.17f, 0.45f, 0.3f, 0.14f);
+    pushBox(verts, idx, -0.14f, 3.1f, -0.14f, 0.14f, 4.7f, 0.14f, 0.42f, 0.28f, 0.13f);
+    // layered fronds
+    pushBox(verts, idx, -2.4f, 4.4f, -0.18f, 2.4f, 4.85f, 0.18f, 0.14f, 0.58f, 0.2f);
+    pushBox(verts, idx, -0.18f, 4.4f, -2.4f, 0.18f, 4.85f, 2.4f, 0.12f, 0.52f, 0.18f);
+    pushBox(verts, idx, -1.7f, 4.55f, -1.7f, 1.7f, 5.05f, 1.7f, 0.18f, 0.62f, 0.22f);
+    pushBox(verts, idx, -1.9f, 4.7f, -0.5f, 1.9f, 5.15f, 0.5f, 0.16f, 0.55f, 0.2f);
+    // coconuts
+    pushBox(verts, idx, -0.35f, 4.3f, -0.35f, 0.35f, 4.7f, 0.35f, 0.35f, 0.22f, 0.08f);
     Mesh m; m.upload(verts, idx); return m;
 }
 

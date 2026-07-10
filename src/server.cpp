@@ -81,9 +81,10 @@ static void spawnVehicles(std::vector<Vehicle>& vehs) {
         {0.8f,0.2f,0.2f},{0.2f,0.4f,0.8f},{0.2f,0.7f,0.3f},
         {0.9f,0.6f,0.1f},{0.6f,0.6f,0.65f},{0.1f,0.1f,0.12f}
     };
-    for (int i = 0; i < 20; ++i) {
-        int ri = (i % 5) - 2;
-        float z = ((i / 5) - 2) * BLOCK;
+    // More traffic across the expanded grid
+    for (int i = 0; i < 36; ++i) {
+        int ri = (i % 7) - 3;
+        float z = ((i / 7) - 2) * BLOCK;
         int ci = i % 6;
         float yaw = (i % 2) ? 0.f : 3.14159f;
         add(ri * BLOCK + 1.2f, z, yaw, colors[ci][0], colors[ci][1], colors[ci][2], true);
@@ -319,7 +320,22 @@ int main(int argc, char** argv) {
                     if (payload.size() >= sizeof(ClientHello))
                         std::memcpy(&hello, payload.data(), sizeof(hello));
                     hello.name[MAX_NAME - 1] = 0;
-                    c.name = hello.name[0] ? hello.name : ("Player" + std::to_string(c.id));
+                    if (hello.name[0] && std::strcmp(hello.name, "Player") != 0)
+                        c.name = hello.name;
+                    else {
+                        // Assign a random Vice-style name
+                        static const char* adj[] = {
+                            "Neon","Palm","Coral","Vice","Sunset","Turbo","Chrome","Miami"
+                        };
+                        static const char* noun[] = {
+                            "Rider","Ace","Kid","Wolf","Fox","Drift","Pulse","Wave"
+                        };
+                        char gen[MAX_NAME];
+                        std::snprintf(gen, sizeof(gen), "%s%s%u",
+                                      adj[c.id % 8], noun[(c.id * 3) % 8],
+                                      10u + (c.id * 7u) % 90u);
+                        c.name = gen;
+                    }
                     auto wel = buildWelcome(c.id, vehicles);
                     if (!sendPacket(c.fd, S_WELCOME, wel)) {
                         c.alive = false;

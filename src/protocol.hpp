@@ -12,6 +12,8 @@ static constexpr uint16_t MAX_NAME = 16;
 static constexpr uint16_t MAX_PLAYERS = 32;
 static constexpr uint16_t MAX_VEHICLES = 48;
 static constexpr int DEFAULT_PORT = 9043;
+// Cloudflare Tunnel published TCP app → tcp://localhost:9043
+static constexpr const char* DEFAULT_HOST = "robot.immenseaccumulationonline.online";
 
 enum MsgType : uint16_t {
     C_HELLO    = 1,  // ClientHello

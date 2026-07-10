@@ -1,8 +1,8 @@
 # Leonida Lights — client + multiplayer server
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra
-INCLUDES  = -Isrc $(shell pkg-config --cflags glfw3 glew 2>/dev/null)
-LIBS_GL   = $(shell pkg-config --libs glfw3 glew 2>/dev/null) -lGL -ldl -lpthread
+INCLUDES  = -Isrc $(shell pkg-config --cflags glfw3 glew freetype2 2>/dev/null)
+LIBS_GL   = $(shell pkg-config --libs glfw3 glew freetype2 2>/dev/null) -lGL -ldl -lpthread
 LIBS_NET  = -ldl -lpthread
 
 CLIENT = gta6_clone
